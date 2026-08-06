@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 
 app = FastAPI()
+# Create our backend app
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,6 +15,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Allows our webpage to talk to this backend safely
 
 conn = sqlite3.connect("memory.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -26,20 +28,28 @@ CREATE TABLE IF NOT EXISTS history (
 )
 """)
 conn.commit()
+# Sets up our memory database file, with a timestamp column
 
-# If the table already existed WITHOUT a timestamp column, add it safely
 try:
     cursor.execute("ALTER TABLE history ADD COLUMN timestamp TEXT")
     conn.commit()
 except Exception:
-    pass  # column already exists, ignore
+    pass
+# Safety check in case the timestamp column didn't exist yet
 
 class ChatRequest(BaseModel):
     message: str
+# What a normal text-only message looks like
+
+class ImageChatRequest(BaseModel):
+    message: str
+    image_base64: str
+# What a message WITH an image looks like (image sent as text data)
 
 
 def get_time():
     return datetime.now().strftime("%I:%M %p on %B %d, %Y")
+# Tool: gets the real current time from your PC
 
 def calculate(expression):
     try:
@@ -50,6 +60,7 @@ def calculate(expression):
             return "Invalid expression"
     except Exception:
         return "Error calculating that"
+# Tool: solves basic math safely
 
 
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools.
@@ -59,17 +70,12 @@ TOOL: get_time()
 or
 TOOL: calculate(expression)
 
-Examples:
-User: what time is it?
-You: TOOL: get_time()
-
-User: what's 12 times 4?
-You: TOOL: calculate(12*4)
-
 For anything else, just respond normally as a helpful assistant.
 """
+# Instructions that teach the AI how to ask for a tool
 
 def ask_ollama_chat(messages):
+    # Sends a normal text conversation to our TEXT-ONLY model (llama3.1)
     response = requests.post(
         "http://localhost:11434/api/chat",
         json={"model": "llama3.1", "messages": messages, "stream": False}
@@ -78,6 +84,7 @@ def ask_ollama_chat(messages):
 
 
 def save_message(role, content):
+    # Saves every message into our database, with the exact date/time
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
         "INSERT INTO history (role, content, timestamp) VALUES (?, ?, ?)",
@@ -89,10 +96,13 @@ def save_message(role, content):
 @app.get("/")
 def read_root():
     return {"status": "Backend is running"}
+# Simple test route to check the server is alive
 
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    # This runs for NORMAL text messages (no image)
+
     save_message("user", request.message)
 
     cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 10")
@@ -105,6 +115,7 @@ def chat(request: ChatRequest):
 
     ai_reply = ask_ollama_chat(messages)
 
+    # Check if the AI wants to use a tool
     tool_match = re.search(r"TOOL:\s*(\w+)\((.*)\)", ai_reply)
 
     if tool_match:
@@ -128,9 +139,38 @@ def chat(request: ChatRequest):
     return {"reply": ai_reply}
 
 
+@app.post("/chat-image")
+def chat_image(request: ImageChatRequest):
+    # This runs ONLY when a message includes an image
+    # It uses "llava" (our vision model) instead of llama3.1
+
+    save_message("user", request.message + " [sent an image]")
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "llava",
+            "prompt": request.message,
+            "images": [request.image_base64],
+            "stream": False
+        }
+    )
+    result = response.json()
+
+    # If Ollama sent back an error instead of a real reply, show it clearly
+    if "response" not in result:
+        return {"reply": f"Error from vision model: {result}"}
+
+    ai_reply = result["response"]
+
+    save_message("assistant", ai_reply)
+
+    return {"reply": ai_reply}
+
+
 @app.get("/history")
 def get_history():
-    # Returns ALL past messages with their timestamps, oldest first
+    # Returns every message ever saved, oldest first
     cursor.execute("SELECT role, content, timestamp FROM history ORDER BY id ASC")
     rows = cursor.fetchall()
     return {
