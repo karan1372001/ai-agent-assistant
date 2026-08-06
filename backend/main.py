@@ -21,16 +21,22 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role TEXT,
-    content TEXT
+    content TEXT,
+    timestamp TEXT
 )
 """)
 conn.commit()
 
+# If the table already existed WITHOUT a timestamp column, add it safely
+try:
+    cursor.execute("ALTER TABLE history ADD COLUMN timestamp TEXT")
+    conn.commit()
+except Exception:
+    pass  # column already exists, ignore
+
 class ChatRequest(BaseModel):
     message: str
 
-
-# ---------- TOOLS ----------
 
 def get_time():
     return datetime.now().strftime("%I:%M %p on %B %d, %Y")
@@ -64,16 +70,20 @@ For anything else, just respond normally as a helpful assistant.
 """
 
 def ask_ollama_chat(messages):
-    # Uses Ollama's proper chat endpoint (better instruction-following than raw text)
     response = requests.post(
         "http://localhost:11434/api/chat",
-        json={
-            "model": "llama3.1",
-            "messages": messages,
-            "stream": False
-        }
+        json={"model": "llama3.1", "messages": messages, "stream": False}
     )
     return response.json()["message"]["content"]
+
+
+def save_message(role, content):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "INSERT INTO history (role, content, timestamp) VALUES (?, ?, ?)",
+        (role, content, timestamp)
+    )
+    conn.commit()
 
 
 @app.get("/")
@@ -83,14 +93,12 @@ def read_root():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    cursor.execute("INSERT INTO history (role, content) VALUES (?, ?)", ("user", request.message))
-    conn.commit()
+    save_message("user", request.message)
 
     cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 10")
     recent = cursor.fetchall()
     recent.reverse()
 
-    # Build a proper messages list (system + user/assistant history)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for role, content in recent:
         messages.append({"role": "user" if role == "user" else "assistant", "content": content})
@@ -110,13 +118,23 @@ def chat(request: ChatRequest):
         else:
             tool_result = "Unknown tool"
 
-        # Give the AI the real result and ask for a natural reply
         messages.append({"role": "assistant", "content": ai_reply})
         messages.append({"role": "user", "content": f"Tool result: {tool_result}. Now reply to me naturally using this result."})
 
         ai_reply = ask_ollama_chat(messages)
 
-    cursor.execute("INSERT INTO history (role, content) VALUES (?, ?)", ("assistant", ai_reply))
-    conn.commit()
+    save_message("assistant", ai_reply)
 
     return {"reply": ai_reply}
+
+
+@app.get("/history")
+def get_history():
+    # Returns ALL past messages with their timestamps, oldest first
+    cursor.execute("SELECT role, content, timestamp FROM history ORDER BY id ASC")
+    rows = cursor.fetchall()
+    return {
+        "history": [
+            {"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows
+        ]
+    }
