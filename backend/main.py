@@ -1,53 +1,66 @@
 from fastapi import FastAPI
-# FastAPI = the tool that lets us build our backend server
-
 from fastapi.middleware.cors import CORSMiddleware
-# This lets our webpage (frontend) talk to our backend safely
-
 from pydantic import BaseModel
-# This helps us define what kind of data we expect to receive
-
 import requests
-# This lets our backend send requests to Ollama (our local AI)
+import sqlite3
 
 app = FastAPI()
-# Create our actual backend app
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Allow requests from any website (fine for now, while testing)
-    allow_methods=["*"],   # Allow all types of requests (GET, POST, etc.)
-    allow_headers=["*"],   # Allow all header types
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# Without this, your webpage wouldn't be allowed to talk to your backend
+
+# Set up a simple database file to store chat history
+conn = sqlite3.connect("memory.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT,
+    content TEXT
+)
+""")
+conn.commit()
 
 class ChatRequest(BaseModel):
     message: str
-# This defines what data we expect when someone sends a chat message
-# We expect one thing: a "message" that is text
 
 @app.get("/")
 def read_root():
     return {"status": "Backend is running"}
-# This is a simple test route - if you visit the homepage, it confirms the server is alive
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    # This function runs whenever someone sends a message to /chat
+    # Save the user's message into memory
+    cursor.execute("INSERT INTO history (role, content) VALUES (?, ?)", ("user", request.message))
+    conn.commit()
+
+    # Get the last 10 messages so the AI remembers recent conversation
+    cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 10")
+    recent = cursor.fetchall()
+    recent.reverse()  # put them back in correct order (oldest to newest)
+
+    # Build a conversation string to send to the AI
+    conversation = ""
+    for role, content in recent:
+        conversation += f"{role}: {content}\n"
 
     response = requests.post(
         "http://localhost:11434/api/generate",
-        # This is Ollama's local address - our AI model running on your PC
-
         json={
-            "model": "llama3.1",       # Which AI model to use
-            "prompt": request.message, # The message the user typed
-            "stream": False            # Get the full answer at once (not word-by-word)
+            "model": "llama3.1",
+            "prompt": conversation,
+            "stream": False
         }
     )
-
     result = response.json()
-    # Convert Ollama's reply into usable data
+    ai_reply = result["response"]
 
-    return {"reply": result["response"]}
-    # Send the AI's reply back to the webpage
+    # Save the AI's reply into memory too
+    cursor.execute("INSERT INTO history (role, content) VALUES (?, ?)", ("assistant", ai_reply))
+    conn.commit()
+
+    return {"reply": ai_reply}
