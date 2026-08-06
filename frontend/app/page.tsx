@@ -1,74 +1,117 @@
-"use client"; 
-// This tells Next.js: "this page needs to run in the browser" (because we're using buttons, typing, etc.)
+"use client";
+import { useState, useRef, useEffect } from "react";
 
-import { useState } from "react"; 
-// This lets us store and update values on the page (like the message you type)
+// This defines what one chat message looks like
+type Message = {
+  role: "user" | "ai";
+  text: string;
+};
 
 export default function Home() {
-  // This is the main webpage component - everything inside runs when the page loads
+  const [messages, setMessages] = useState<Message[]>([]);
+  // messages = the full conversation shown on screen (list of user + AI messages)
 
-  const [message, setMessage] = useState(""); 
-  // "message" = what you're currently typing
-  // setMessage = the function we use to update it
+  const [input, setInput] = useState("");
+  // input = whatever you're currently typing
 
-  const [reply, setReply] = useState(""); 
-  // "reply" = the AI's response, starts empty
+  const [loading, setLoading] = useState(false);
+  // loading = true while waiting for AI reply
 
-  const [loading, setLoading] = useState(false); 
-  // "loading" = true while we're waiting for the AI to respond, so we can show "Thinking..."
+  const bottomRef = useRef<HTMLDivElement>(null);
+  // this helps us auto-scroll to the newest message
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+  // every time messages change, scroll down automatically
 
   async function sendMessage() {
-    // This function runs when you click the Send button
+    if (!input.trim()) return; // don't send empty messages
 
-    setLoading(true); 
-    // Show "Thinking..." while we wait
+    const userMessage: Message = { role: "user", text: input };
+    setMessages((prev) => [...prev, userMessage]);
+    // add your message to the chat immediately
+
+    setInput(""); // clear the input box
+    setLoading(true);
 
     const res = await fetch("http://127.0.0.1:8000/chat", {
-      // Send your message to your Python backend (the one running on port 8000)
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }), 
-      // Package your typed message to send it
+      body: JSON.stringify({ message: userMessage.text }),
     });
 
-    const data = await res.json(); 
-    // Wait for the backend's response and convert it to usable data
+    const data = await res.json();
 
-    setReply(data.reply); 
-    // Show the AI's reply on screen
+    const aiMessage: Message = { role: "ai", text: data.reply };
+    setMessages((prev) => [...prev, aiMessage]);
+    // add the AI's reply to the chat
 
-    setLoading(false); 
-    // Stop showing "Thinking..."
+    setLoading(false);
   }
 
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+  // lets you press Enter to send, like a real chat app
+
   return (
-    // This is what actually shows up on the webpage (the visible design)
-
-    <div style={{ padding: "40px", maxWidth: "600px", margin: "0 auto" }}>
+    <div className="flex flex-col h-screen bg-gray-100">
       
-      <h1>My AI Assistant</h1>
-      {/* Page title */}
+      {/* Header */}
+      <div className="bg-white shadow p-4">
+        <h1 className="text-xl font-semibold">Karan's AI Assistant</h1>
+      </div>
 
-      <textarea
-        value={message}
-        onChange={(e) => setMessage(e.target.value)} 
-        // Every time you type, update "message" with what you typed
-        placeholder="Type your message..."
-        style={{ width: "100%", height: "100px", padding: "10px" }}
-      />
-      {/* This is the box where you type your message */}
+      {/* Chat messages area */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {messages.map((msg, index) => (
+          <div
+            key={index}
+            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+          >
+            <div
+              className={`max-w-[70%] px-4 py-2 rounded-2xl ${
+                msg.role === "user"
+                  ? "bg-blue-600 text-white rounded-br-none"
+                  : "bg-white text-gray-800 rounded-bl-none shadow"
+              }`}
+            >
+              {msg.text}
+            </div>
+          </div>
+        ))}
 
-      <br />
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-white text-gray-500 px-4 py-2 rounded-2xl shadow">
+              Thinking...
+            </div>
+          </div>
+        )}
 
-      <button onClick={sendMessage} style={{ marginTop: "10px", padding: "10px 20px" }}>
-        {loading ? "Thinking..." : "Send"}
-        {/* Button text changes to "Thinking..." while waiting for AI */}
-      </button>
+        <div ref={bottomRef} />
+      </div>
 
-      <div style={{ marginTop: "20px", padding: "10px", background: "#f0f0f0" }}>
-        <strong>AI Reply:</strong>
-        <p>{reply}</p>
-        {/* This is where the AI's answer appears */}
+      {/* Input area */}
+      <div className="p-4 bg-white border-t flex gap-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Type a message..."
+          className="flex-1 resize-none border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          rows={1}
+        />
+        <button
+          onClick={sendMessage}
+          className="bg-blue-600 text-white px-4 py-2 rounded-xl hover:bg-blue-700"
+        >
+          Send
+        </button>
       </div>
     </div>
   );
