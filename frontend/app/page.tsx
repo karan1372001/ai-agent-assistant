@@ -20,12 +20,59 @@ export default function Home() {
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  // isListening = true while the microphone is actively listening to you
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const recognitionRef = useRef<any>(null);
+  // recognitionRef = holds the browser's built-in speech recognition tool
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    // Set up the browser's speech recognition ONCE when the page loads
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    // Chrome calls it "webkitSpeechRecognition" internally
+
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false; // stops listening after one sentence
+      recognition.interimResults = false; // only gives us the final text, not partial guesses
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event: any) => {
+        // This runs when the browser finishes understanding what you said
+        const transcript = event.results[0][0].transcript;
+        setInput(transcript); // put the spoken text into the input box
+      };
+
+      recognition.onend = () => {
+        setIsListening(false); // turn off the "listening" indicator when done
+      };
+
+      recognitionRef.current = recognition;
+    }
+  }, []);
+
+  function startListening() {
+    if (recognitionRef.current) {
+      setIsListening(true);
+      recognitionRef.current.start(); // begin listening through your microphone
+    } else {
+      alert("Voice input isn't supported in this browser. Try Chrome.");
+    }
+  }
+
+  function speakText(text: string) {
+    // Makes your browser read the AI's reply out loud
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    window.speechSynthesis.speak(utterance);
+  }
 
   function handleAttachClick() {
     fileInputRef.current?.click();
@@ -82,6 +129,9 @@ export default function Home() {
     const data = await res.json();
     const aiMessage: Message = { role: "ai", text: data.reply };
     setMessages((prev) => [...prev, aiMessage]);
+
+    speakText(data.reply);
+    // As soon as the AI replies, read it out loud automatically
 
     setLoading(false);
   }
@@ -212,11 +262,21 @@ export default function Home() {
           📎
         </button>
 
+        <button
+          onClick={startListening}
+          className={`px-3 py-2 rounded-xl text-lg ${
+            isListening ? "bg-red-500 text-white animate-pulse" : "bg-gray-200 hover:bg-gray-300"
+          }`}
+          title="Speak your message"
+        >
+          🎤
+        </button>
+
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Type a message..."
+          placeholder="Type or speak a message..."
           className="flex-1 resize-none border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
           rows={1}
         />
