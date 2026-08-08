@@ -6,7 +6,12 @@ import sqlite3
 import re
 import json
 import math
+import time
+# time lets us pause briefly between retry attempts when searching
+
 from datetime import datetime
+from ddgs import DDGS
+# This is a purpose-built tool for searching DuckDuckGo without triggering CAPTCHAs
 
 app = FastAPI()
 # Create our backend app
@@ -31,16 +36,15 @@ CREATE TABLE IF NOT EXISTS history (
 )
 """)
 conn.commit()
-# Sets up our memory database - now with an extra "embedding" column
-# This will store each message's "meaning fingerprint" for smart search
+# Sets up our memory database
 
-# Safety check: adds missing columns if this is an older database file
 for column in ["timestamp", "embedding"]:
     try:
         cursor.execute(f"ALTER TABLE history ADD COLUMN {column} TEXT")
         conn.commit()
     except Exception:
         pass
+# Safety check for older database files missing these columns
 
 
 class ChatRequest(BaseModel):
@@ -69,9 +73,41 @@ def calculate(expression):
 # Tool: solves basic math safely
 
 
+def search_web(query):
+    # Tool: does a REAL web search and returns real, current results
+    # Includes automatic retries in case DuckDuckGo temporarily rate-limits us
+
+    max_attempts = 3
+    # Try up to 3 times before giving up
+
+    for attempt in range(max_attempts):
+        try:
+            with DDGS() as ddgs:
+                results = ddgs.text(query, max_results=3)
+                # Ask DuckDuckGo for the top 3 results on this query
+
+            if results:
+                # Success! We got real results, so build and return them
+                output = []
+                for r in results:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    output.append(f"{title}: {body}")
+                return "\n".join(output)
+
+            # If results were empty, wait a bit and try again
+            time.sleep(2)
+
+        except Exception as e:
+            # If something went wrong (like a temporary block), wait and try again
+            time.sleep(2)
+
+    # If all attempts failed, give an honest answer instead of pretending
+    return "I searched but couldn't retrieve results right now (search engine may be temporarily rate-limited). Please try again in a moment."
+
+
 def get_embedding(text):
-    # Turns any piece of text into a list of numbers that represents its MEANING
-    # Similar meaning = similar numbers, even if the words are totally different
+    # Converts text into a "meaning fingerprint" for smart memory search
     response = requests.post(
         "http://localhost:11434/api/embeddings",
         json={"model": "nomic-embed-text", "prompt": text}
@@ -80,8 +116,7 @@ def get_embedding(text):
 
 
 def cosine_similarity(a, b):
-    # Compares two "meaning fingerprints" and returns how similar they are
-    # 1.0 = basically identical meaning, 0.0 = completely unrelated
+    # Measures how similar in meaning two fingerprints are
     dot = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))
@@ -91,15 +126,11 @@ def cosine_similarity(a, b):
 
 
 def find_relevant_memories(current_message, limit=5):
-    # This is the "smart search" - looks through EVERY past message ever saved
-    # and finds the ones most relevant to what you just said, no matter how old
-
+    # Searches ALL past messages for the ones most relevant to the current message
     current_embedding = get_embedding(current_message)
-    # Get the meaning fingerprint of your new message
 
     cursor.execute("SELECT role, content, embedding FROM history WHERE embedding IS NOT NULL")
     all_rows = cursor.fetchall()
-    # Grab every past message that has a saved fingerprint
 
     scored = []
     for role, content, embedding_json in all_rows:
@@ -108,21 +139,26 @@ def find_relevant_memories(current_message, limit=5):
         stored_embedding = json.loads(embedding_json)
         score = cosine_similarity(current_embedding, stored_embedding)
         scored.append((score, role, content))
-    # Compare your new message against every old one, and score how related they are
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    # Put the most relevant matches first
-
     return scored[:limit]
-    # Return only the top few most relevant memories
 
 
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools and long-term memory.
 
-RULE: If the user asks for the time, date, or a math calculation, you MUST respond with ONLY this exact format and nothing else:
+RULE: If the user asks for the time, date, a math calculation, or wants you to search the internet 
+for current information, you MUST respond with ONLY this exact format and nothing else:
 TOOL: get_time()
 or
 TOOL: calculate(expression)
+or
+TOOL: search_web(query)
+
+Use search_web whenever the user asks about something current, recent, or that you might not know.
+
+Examples:
+User: what's the latest news about AI?
+You: TOOL: search_web(latest AI news)
 
 You may also be given "Relevant memories" from past conversations. Use them naturally if helpful, 
 but don't mention that you're using stored memories - just respond naturally, like you remember.
@@ -141,7 +177,7 @@ def ask_ollama_chat(messages):
 
 
 def save_message(role, content):
-    # Saves a message into the database, WITH its meaning fingerprint and timestamp
+    # Saves a message into the database, with its meaning fingerprint and timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -149,7 +185,6 @@ def save_message(role, content):
         embedding_json = json.dumps(embedding)
     except Exception:
         embedding_json = None
-    # If embedding fails for some reason, we still save the message, just without search capability
 
     cursor.execute(
         "INSERT INTO history (role, content, timestamp, embedding) VALUES (?, ?, ?, ?)",
@@ -166,14 +201,11 @@ def read_root():
 @app.post("/chat")
 def chat(request: ChatRequest):
     save_message("user", request.message)
-    # Save your new message (this also creates its fingerprint)
 
-    # Get the last 6 messages, for natural short-term conversation flow
     cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6")
     recent = cursor.fetchall()
     recent.reverse()
 
-    # Get relevant OLD memories, even from way back, based on meaning
     relevant = find_relevant_memories(request.message, limit=5)
 
     memory_context = ""
@@ -181,13 +213,11 @@ def chat(request: ChatRequest):
         memory_context = "Relevant memories from past conversations:\n"
         for score, role, content in relevant:
             memory_context += f"- {role}: {content}\n"
-    # Build a small summary of relevant past info to give the AI extra context
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + memory_context}]
 
     for role, content in recent:
         messages.append({"role": "user" if role == "user" else "assistant", "content": content})
-    # Add the recent conversation on top, so it flows naturally
 
     ai_reply = ask_ollama_chat(messages)
 
@@ -202,6 +232,8 @@ def chat(request: ChatRequest):
             tool_result = get_time()
         elif tool_name == "calculate":
             tool_result = calculate(tool_arg)
+        elif tool_name == "search_web":
+            tool_result = search_web(tool_arg)
         else:
             tool_result = "Unknown tool"
 
