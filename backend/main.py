@@ -1,3 +1,11 @@
+# =============================================================================
+#  KARAN'S AI ASSISTANT - BACKEND (main.py)
+#  This file runs the "brain" of the assistant: it talks to Ollama (the AI
+#  models running on your own PC), remembers past conversations, can search
+#  the web, can control your computer (with your permission), and understands
+#  images.
+# =============================================================================
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,6 +20,7 @@ import webbrowser
 import subprocess
 import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from ddgs import DDGS
 import pywhatkit
 
@@ -24,6 +33,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------------------------------------------------------
+# DATABASE SETUP
+# -----------------------------------------------------------------------------
 conn = sqlite3.connect("memory.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -60,9 +72,9 @@ class ApprovalRequest(BaseModel):
 PENDING_ACTIONS = {}
 
 
-# ---------- FACTS SYSTEM ----------
-# Important facts about the user, saved permanently and ALWAYS included in every conversation
-# This is more reliable than semantic search for critical info like name, preferences, etc.
+# =============================================================================
+# FACTS SYSTEM
+# =============================================================================
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS facts (
@@ -84,9 +96,6 @@ def get_all_facts():
 
 
 def detect_and_save_facts(message):
-    # Looks for common patterns like "my favorite X is Y" or "my name is X"
-    # and saves them as permanent facts that are ALWAYS remembered
-
     message_lower = message.lower()
 
     lang_match = re.search(r"favou?rite (?:programming |coding )?language is (\w+)", message_lower)
@@ -106,8 +115,47 @@ def detect_and_save_facts(message):
         save_fact("nickname", nickname_match.group(1).upper())
 
 
-def get_time():
-    return datetime.now().strftime("%I:%M %p on %B %d, %Y")
+# =============================================================================
+# SIMPLE TOOLS
+# =============================================================================
+
+TIMEZONE_MAP = {
+    "uk": "Europe/London",
+    "united kingdom": "Europe/London",
+    "england": "Europe/London",
+    "london": "Europe/London",
+    "india": "Asia/Kolkata",
+    "usa": "America/New_York",
+    "us": "America/New_York",
+    "united states": "America/New_York",
+    "new york": "America/New_York",
+    "california": "America/Los_Angeles",
+    "los angeles": "America/Los_Angeles",
+    "japan": "Asia/Tokyo",
+    "tokyo": "Asia/Tokyo",
+    "australia": "Australia/Sydney",
+    "sydney": "Australia/Sydney",
+    "dubai": "Asia/Dubai",
+    "uae": "Asia/Dubai",
+    "germany": "Europe/Berlin",
+    "france": "Europe/Paris",
+    "canada": "America/Toronto",
+    "singapore": "Asia/Singapore",
+}
+
+
+def get_time(location=None):
+    if location:
+        location_key = location.strip().lower()
+        tz_name = TIMEZONE_MAP.get(location_key)
+        if tz_name:
+            now = datetime.now(ZoneInfo(tz_name))
+            return now.strftime("%I:%M %p on %B %d, %Y") + f" ({location.strip()} time)"
+        else:
+            return f"I don't have timezone data for '{location.strip()}' yet, so I can't give an exact local time for it."
+
+    return datetime.now().strftime("%I:%M %p on %B %d, %Y") + " (your local time)"
+
 
 def calculate(expression):
     try:
@@ -138,6 +186,10 @@ def search_web(query):
             time.sleep(2)
     return "I searched but couldn't retrieve results right now. Please try again in a moment."
 
+
+# =============================================================================
+# COMPUTER CONTROL TOOLS
+# =============================================================================
 
 def open_app(app_name):
     try:
@@ -196,11 +248,50 @@ def determine_opener_app(description):
         return "notepad"
 
 
+def extract_custom_path(description):
+    path_match = re.search(r'[a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\?)+', description)
+    if path_match:
+        return path_match.group(0).rstrip("\\")
+    return None
+
+
+def extract_custom_filename(description):
+    match = re.search(
+        r'(?:save(?: it| this)?\s+as|name(?:d)?\s+it|call(?:ed)?\s+it)\s+'
+        r'([a-zA-Z0-9_\-. ]+?)(?=\s+(?:in|at|on|to)\b|[,]|$)',
+        description,
+        re.IGNORECASE
+    )
+    if not match:
+        return None
+
+    captured = match.group(1).strip()
+    captured = re.sub(r'\s+name$', '', captured, flags=re.IGNORECASE)
+    return captured.replace(" ", "_")
+
+
 def create_and_open_file(content, description):
     try:
-        extension = determine_file_extension(description)
-        filename = f"generated_file{extension}"
-        folder = os.path.join(os.path.expanduser("~"), "Desktop")
+        custom_filename = extract_custom_filename(description)
+
+        if custom_filename:
+            has_extension = re.search(r'\.[a-zA-Z0-9]{1,10}$', custom_filename)
+            if has_extension:
+                filename = custom_filename
+            else:
+                extension = determine_file_extension(description)
+                filename = f"{custom_filename}{extension}"
+        else:
+            extension = determine_file_extension(description)
+            filename = f"generated_file{extension}"
+
+        custom_path = extract_custom_path(description)
+        if custom_path:
+            folder = custom_path
+            os.makedirs(folder, exist_ok=True)
+        else:
+            folder = os.path.join(os.path.expanduser("~"), "Desktop")
+
         filepath = os.path.join(folder, filename)
 
         with open(filepath, "w") as f:
@@ -215,13 +306,22 @@ def create_and_open_file(content, description):
             subprocess.Popen(["notepad.exe", filepath])
             app_used = "Notepad"
 
-        return f"Created {filename} on your Desktop and opened it in {app_used}"
+        return f"Created {filename} in {folder} and opened it in {app_used}"
     except Exception as e:
         return f"Failed to create file: {e}"
 
 
 COMPUTER_CONTROL_TOOLS = ["open_app", "open_website", "play_youtube", "open_folder", "create_file"]
 
+# THE CHAINING FIX: how many rounds of "AI asks for a tool -> we run it ->
+# AI replies again" we allow in a single request, before giving up. This
+# stops raw, un-executed "TOOL: ..." text from ever reaching your screen.
+MAX_TOOL_ROUNDS = 4
+
+
+# =============================================================================
+# SMART LONG-TERM MEMORY
+# =============================================================================
 
 def get_embedding(text):
     response = requests.post(
@@ -255,6 +355,10 @@ def find_relevant_memories(current_message, limit=5):
     return scored[:limit]
 
 
+# =============================================================================
+# THE AI'S "PERSONALITY" AND INSTRUCTIONS
+# =============================================================================
+
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools, long-term memory, and computer control.
 
 RULE: To use a tool, respond with ONLY tool lines in this exact format, one per line, nothing else:
@@ -264,18 +368,28 @@ If the user's request needs MULTIPLE actions done in order, output MULTIPLE tool
 in the order they should happen.
 
 Available tools:
-- get_time() -> current date and time
+- get_time() -> current date and time where YOU are. get_time(location) -> the accurate current
+  time in another place, e.g. get_time(UK) or get_time(India). ALWAYS use this tool for any
+  question about the current time or date, anywhere - NEVER use search_web for time/date questions,
+  since web search results can be old and give the wrong answer.
 - calculate(expression) -> basic math
-- search_web(query) -> search the internet for current info
+- search_web(query) -> search the internet for current info (news, facts, weather, etc - NOT for
+  telling the time)
 - open_app(app_name) -> opens an application
 - open_website(url) -> opens a website
 - play_youtube(song_name) -> searches and plays a video on YouTube
 - open_folder(path) -> opens an EXISTING folder to browse files
-- create_file(description) -> writes code/content to a file and opens it in notepad or vscode
+- create_file(description) -> writes code/content to a file and opens it in notepad or vscode.
+  If the user gives a filename (e.g. "save it as KD.html" or "save it as Karan")
+  or a folder path (e.g. "E:\\MyFolder"), include that exact wording in the
+  description so it gets saved with the right name and in the right place.
 
 Examples:
 User: open chrome
 You: TOOL: open_app(chrome)
+
+User: what time is it in the UK
+You: TOOL: get_time(UK)
 
 User: play gta 6 trailer on youtube
 You: TOOL: play_youtube(gta 6 trailer)
@@ -283,6 +397,9 @@ You: TOOL: play_youtube(gta 6 trailer)
 User: write python code and open it in vscode, then also open my documents folder
 You: TOOL: create_file(python code, open in vscode)
 TOOL: open_folder(C:\\Users\\KARAN\\Documents)
+
+User: write html code for a landing page, save it as KD.html in E:\Projects
+You: TOOL: create_file(html code for a landing page, save it as KD.html in E:\\Projects)
 
 You will be given "Known facts about the user" - these are permanent, reliable facts (name, 
 preferences, etc.) that you should ALWAYS remember and use correctly, no matter how far back 
@@ -315,6 +432,10 @@ def save_message(role, content):
     )
     conn.commit()
 
+
+# =============================================================================
+# PERMISSION SYSTEM
+# =============================================================================
 
 def create_permission_request(steps):
     first_tool_name, first_tool_arg = steps[0]
@@ -370,6 +491,10 @@ def run_single_tool(tool_name, tool_arg, content=None):
         return "Unknown tool"
 
 
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
 @app.get("/")
 def read_root():
     return {"status": "Backend is running"}
@@ -409,9 +534,18 @@ def chat(request: ChatRequest):
 
     ai_reply = ask_ollama_chat(messages)
 
-    tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
+    # THE CHAINING FIX: repeat this check up to MAX_TOOL_ROUNDS times, so
+    # if the AI wants to use ANOTHER tool after seeing the first tool's
+    # results (e.g. searching again with better keywords), it actually
+    # gets to run - instead of that request just leaking out as raw,
+    # un-executed "TOOL: ..." text like you saw before.
+    for round_number in range(MAX_TOOL_ROUNDS):
+        tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
 
-    if tool_matches:
+        if not tool_matches:
+            # No tool calls this round - this is a normal, final reply
+            break
+
         computer_steps = []
         tool_results = []
 
@@ -419,19 +553,34 @@ def chat(request: ChatRequest):
             if tool_name in COMPUTER_CONTROL_TOOLS:
                 computer_steps.append((tool_name, tool_arg))
             elif tool_name == "get_time":
-                tool_results.append(get_time())
+                tool_results.append(get_time(tool_arg.strip() if tool_arg.strip() else None))
             elif tool_name == "calculate":
                 tool_results.append(calculate(tool_arg))
             elif tool_name == "search_web":
                 tool_results.append(search_web(tool_arg))
 
         if computer_steps:
+            # Computer actions ALWAYS need your permission, no matter which
+            # round of the loop we're on - stop immediately and ask
             return create_permission_request(computer_steps)
 
         if tool_results:
             messages.append({"role": "assistant", "content": ai_reply})
             messages.append({"role": "user", "content": f"Tool results: {'; '.join(tool_results)}. Now reply to me naturally using these results."})
             ai_reply = ask_ollama_chat(messages)
+        else:
+            # Tool calls were found but didn't match any known tool name -
+            # stop here rather than looping forever on something we can't handle
+            break
+
+    # SAFETY NET: if we somehow hit the round limit and there's still a raw
+    # "TOOL: ..." line left in the text, strip it out so you never see
+    # unexecuted tool instructions in the chat
+    cleaned_reply = re.sub(r"TOOLS?:\s*\w+\(.*?\)\s*", "", ai_reply).strip()
+    if cleaned_reply:
+        ai_reply = cleaned_reply
+    else:
+        ai_reply = "I tried a few different approaches but couldn't get a clean final answer - could you try rephrasing your question?"
 
     save_message("assistant", ai_reply)
     return {"reply": ai_reply, "needs_permission": False}
