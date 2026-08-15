@@ -58,8 +58,52 @@ class ApprovalRequest(BaseModel):
 
 
 PENDING_ACTIONS = {}
-# Each pending action can now hold a LIST of remaining steps, not just one
-# This lets us chain multiple actions together, one approval at a time
+
+
+# ---------- FACTS SYSTEM ----------
+# Important facts about the user, saved permanently and ALWAYS included in every conversation
+# This is more reliable than semantic search for critical info like name, preferences, etc.
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS facts (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+conn.commit()
+
+
+def save_fact(key, value):
+    cursor.execute("INSERT OR REPLACE INTO facts (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def get_all_facts():
+    cursor.execute("SELECT key, value FROM facts")
+    return cursor.fetchall()
+
+
+def detect_and_save_facts(message):
+    # Looks for common patterns like "my favorite X is Y" or "my name is X"
+    # and saves them as permanent facts that are ALWAYS remembered
+
+    message_lower = message.lower()
+
+    lang_match = re.search(r"favou?rite (?:programming |coding )?language is (\w+)", message_lower)
+    if lang_match:
+        save_fact("favorite_language", lang_match.group(1).capitalize())
+
+    name_match = re.search(r"my name is (\w+)", message_lower)
+    if name_match:
+        save_fact("name", name_match.group(1).capitalize())
+
+    fullname_match = re.search(r"my full name is ([\w\s]+)", message_lower)
+    if fullname_match:
+        save_fact("full_name", fullname_match.group(1).strip().title())
+
+    nickname_match = re.search(r"(?:call me|my nickname is) (\w+)", message_lower)
+    if nickname_match:
+        save_fact("nickname", nickname_match.group(1).upper())
 
 
 def get_time():
@@ -217,7 +261,7 @@ RULE: To use a tool, respond with ONLY tool lines in this exact format, one per 
 TOOL: tool_name(argument)
 
 If the user's request needs MULTIPLE actions done in order, output MULTIPLE tool lines, one per line, 
-in the order they should happen. For example, if the user wants two things done, write two TOOL lines.
+in the order they should happen.
 
 Available tools:
 - get_time() -> current date and time
@@ -225,11 +269,9 @@ Available tools:
 - search_web(query) -> search the internet for current info
 - open_app(app_name) -> opens an application
 - open_website(url) -> opens a website
-- play_youtube(song_name) -> searches and plays a video on YouTube (this already opens the browser, 
-  do NOT also use open_app or open_website before it)
+- play_youtube(song_name) -> searches and plays a video on YouTube
 - open_folder(path) -> opens an EXISTING folder to browse files
-- create_file(description) -> writes code/content to a file and opens it in notepad or vscode 
-  (include "open in notepad" or "open in vscode" in the description if specified)
+- create_file(description) -> writes code/content to a file and opens it in notepad or vscode
 
 Examples:
 User: open chrome
@@ -242,7 +284,11 @@ User: write python code and open it in vscode, then also open my documents folde
 You: TOOL: create_file(python code, open in vscode)
 TOOL: open_folder(C:\\Users\\KARAN\\Documents)
 
-You may also be given "Relevant memories" from past conversations. Use them naturally.
+You will be given "Known facts about the user" - these are permanent, reliable facts (name, 
+preferences, etc.) that you should ALWAYS remember and use correctly, no matter how far back 
+they were mentioned. Never contradict or forget these facts.
+
+You may also be given "Relevant memories" from past conversations for additional context.
 
 For anything else, just respond normally as a helpful assistant.
 """
@@ -271,9 +317,6 @@ def save_message(role, content):
 
 
 def create_permission_request(steps):
-    # steps = a list of (tool_name, tool_arg) tuples that still need to happen
-    # We ask permission for the FIRST one, and remember the rest for later
-
     first_tool_name, first_tool_arg = steps[0]
     remaining_steps = steps[1:]
 
@@ -313,7 +356,6 @@ def create_permission_request(steps):
 
 
 def run_single_tool(tool_name, tool_arg, content=None):
-    # Actually executes ONE approved action
     if tool_name == "open_app":
         return open_app(tool_arg)
     elif tool_name == "open_website":
@@ -336,8 +378,8 @@ def read_root():
 @app.post("/chat")
 def chat(request: ChatRequest):
     save_message("user", request.message)
+    detect_and_save_facts(request.message)
 
-    # SHORTCUT: reliably catch "play ___ on youtube" without relying on AI guessing
     play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
     if play_match:
         song_name = play_match.group(1)
@@ -349,8 +391,15 @@ def chat(request: ChatRequest):
 
     relevant = find_relevant_memories(request.message, limit=5)
     memory_context = ""
+
+    facts = get_all_facts()
+    if facts:
+        memory_context += "Known facts about the user (ALWAYS remember these, never forget):\n"
+        for key, value in facts:
+            memory_context += f"- {key.replace('_', ' ')}: {value}\n"
+
     if relevant:
-        memory_context = "Relevant memories from past conversations:\n"
+        memory_context += "\nRelevant memories from past conversations:\n"
         for score, role, content in relevant:
             memory_context += f"- {role}: {content}\n"
 
@@ -360,7 +409,6 @@ def chat(request: ChatRequest):
 
     ai_reply = ask_ollama_chat(messages)
 
-    # Find ALL tool calls in the reply, not just the first one - this enables multi-step actions
     tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
 
     if tool_matches:
@@ -377,11 +425,9 @@ def chat(request: ChatRequest):
             elif tool_name == "search_web":
                 tool_results.append(search_web(tool_arg))
 
-        # If there are computer-control steps, ask permission for them (chained)
         if computer_steps:
             return create_permission_request(computer_steps)
 
-        # Otherwise, all tools were safe ones - reply naturally using their results
         if tool_results:
             messages.append({"role": "assistant", "content": ai_reply})
             messages.append({"role": "user", "content": f"Tool results: {'; '.join(tool_results)}. Now reply to me naturally using these results."})
@@ -413,13 +459,11 @@ def approve_action(request: ApprovalRequest):
 
     save_message("assistant", f"Action approved and completed: {tool_result}")
 
-    # If there are more steps left, ask permission for the NEXT one now
     if remaining_steps:
         next_request = create_permission_request(remaining_steps)
         next_request["reply"] = f"{tool_result}\n\nNext: {next_request['reply']}"
         return next_request
 
-    # No more steps - we're fully done
     return {"reply": tool_result, "needs_permission": False}
 
 

@@ -5,6 +5,8 @@ type Message = {
   role: "user" | "ai";
   text: string;
   image?: string;
+  actionId?: string;
+  needsApproval?: boolean;
 };
 
 type HistoryItem = {
@@ -21,37 +23,31 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
-  // isListening = true while the microphone is actively listening to you
-
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
-  // recognitionRef = holds the browser's built-in speech recognition tool
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   useEffect(() => {
-    // Set up the browser's speech recognition ONCE when the page loads
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    // Chrome calls it "webkitSpeechRecognition" internally
 
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
-      recognition.continuous = false; // stops listening after one sentence
-      recognition.interimResults = false; // only gives us the final text, not partial guesses
+      recognition.continuous = false;
+      recognition.interimResults = false;
       recognition.lang = "en-US";
 
       recognition.onresult = (event: any) => {
-        // This runs when the browser finishes understanding what you said
         const transcript = event.results[0][0].transcript;
-        setInput(transcript); // put the spoken text into the input box
+        setInput(transcript);
       };
 
       recognition.onend = () => {
-        setIsListening(false); // turn off the "listening" indicator when done
+        setIsListening(false);
       };
 
       recognitionRef.current = recognition;
@@ -61,14 +57,13 @@ export default function Home() {
   function startListening() {
     if (recognitionRef.current) {
       setIsListening(true);
-      recognitionRef.current.start(); // begin listening through your microphone
+      recognitionRef.current.start();
     } else {
       alert("Voice input isn't supported in this browser. Try Chrome.");
     }
   }
 
   function speakText(text: string) {
-    // Makes your browser read the AI's reply out loud
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "en-US";
     window.speechSynthesis.speak(utterance);
@@ -127,11 +122,51 @@ export default function Home() {
     }
 
     const data = await res.json();
-    const aiMessage: Message = { role: "ai", text: data.reply };
+
+    const aiMessage: Message = {
+      role: "ai",
+      text: data.reply,
+      actionId: data.action_id,
+      needsApproval: data.needs_permission === true,
+    };
     setMessages((prev) => [...prev, aiMessage]);
 
-    speakText(data.reply);
-    // As soon as the AI replies, read it out loud automatically
+    if (!data.needs_permission) {
+      speakText(data.reply);
+    }
+
+    setLoading(false);
+  }
+
+  async function respondToApproval(actionId: string, approved: boolean, messageIndex: number) {
+    setLoading(true);
+
+    const res = await fetch("http://127.0.0.1:8000/approve-action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action_id: actionId, approved }),
+    });
+
+    const data = await res.json();
+
+    // Mark the OLD message as no longer needing approval
+    setMessages((prev) =>
+      prev.map((msg, i) => (i === messageIndex ? { ...msg, needsApproval: false } : msg))
+    );
+
+    // Add the result as a NEW message - this might ALSO need approval
+    // if it's the next step in a multi-step chain
+    const resultMessage: Message = {
+      role: "ai",
+      text: data.reply,
+      actionId: data.action_id,
+      needsApproval: data.needs_permission === true,
+    };
+    setMessages((prev) => [...prev, resultMessage]);
+
+    if (!data.needs_permission) {
+      speakText(data.reply);
+    }
 
     setLoading(false);
   }
@@ -152,7 +187,6 @@ export default function Home() {
 
   return (
     <div className="flex flex-col h-screen bg-gray-100">
-      
       <div className="bg-white shadow p-4 flex justify-between items-center">
         <h1 className="text-xl font-semibold">Karan's AI Assistant</h1>
         <button
@@ -198,7 +232,7 @@ export default function Home() {
             className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div
-              className={`max-w-[70%] px-4 py-2 rounded-2xl ${
+              className={`max-w-[70%] px-4 py-2 rounded-2xl whitespace-pre-wrap ${
                 msg.role === "user"
                   ? "bg-blue-600 text-white rounded-br-none"
                   : "bg-white text-gray-800 rounded-bl-none shadow"
@@ -212,6 +246,23 @@ export default function Home() {
                 />
               )}
               {msg.text}
+
+              {msg.needsApproval && msg.actionId && (
+                <div className="flex gap-2 mt-3">
+                  <button
+                    onClick={() => respondToApproval(msg.actionId!, true, index)}
+                    className="bg-green-600 text-white px-3 py-1.5 rounded-lg text-sm hover:bg-green-700"
+                  >
+                    ✅ Approve
+                  </button>
+                  <button
+                    onClick={() => respondToApproval(msg.actionId!, false, index)}
+                    className="bg-red-500 text-white px-3 py-1.5 rounded-lg text-sm hover:bg-red-600"
+                  >
+                    ❌ Deny
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         ))}
