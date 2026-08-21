@@ -23,9 +23,19 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  // THE NEW CHAT FIX: a unique ID for the CURRENT conversation window.
+  // The AI only looks at recent messages sharing this ID for short-term
+  // context - clicking "New Chat" swaps this out for a brand new one,
+  // giving a clean slate without touching any saved memory or facts.
+  const [sessionId, setSessionId] = useState<string>("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
+
+  useEffect(() => {
+    // Give this browser tab a starting session ID as soon as it loads
+    setSessionId(crypto.randomUUID());
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -85,6 +95,15 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
+  function startNewChat() {
+    // Clears the visible conversation and starts a fresh session ID.
+    // Nothing is deleted from memory.db - your facts and long-term
+    // memories are still fully intact and searchable, this just gives
+    // the AI a clean "recent context" window to start from.
+    setMessages([]);
+    setSessionId(crypto.randomUUID());
+  }
+
   async function sendMessage() {
     if (!input.trim() && !selectedImage) return;
 
@@ -102,8 +121,6 @@ export default function Home() {
     setSelectedImage(null);
     setLoading(true);
 
-    // Images still go through the original, non-streaming flow - a full
-    // vision-model reply usually arrives in one go anyway.
     if (imageToSend) {
       const res = await fetch("http://127.0.0.1:8000/chat-image", {
         method: "POST",
@@ -111,6 +128,7 @@ export default function Home() {
         body: JSON.stringify({
           message: messageText || "What do you see in this image?",
           image_base64: imageToSend,
+          session_id: sessionId,
         }),
       });
       const data = await res.json();
@@ -121,13 +139,10 @@ export default function Home() {
       return;
     }
 
-    // THE STREAMING FIX: text messages now hit /chat-stream and the reply
-    // is read progressively, updating the same message bubble as new
-    // words arrive - instead of waiting for the whole answer at once.
     const res = await fetch("http://127.0.0.1:8000/chat-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: messageText }),
+      body: JSON.stringify({ message: messageText, session_id: sessionId }),
     });
 
     if (!res.body) {
@@ -155,20 +170,16 @@ export default function Home() {
       }
 
       if (accumulatedText.startsWith("PERMISSION_JSON:")) {
-        // This is a permission request, not normal streaming text - wait
-        // until the (short) stream fully ends, then parse it as one piece
         isPermissionResponse = true;
         continue;
       }
 
       if (aiMessageIndex === -1) {
-        // First real chunk of text - create a new AI message bubble
         setMessages((prev) => {
           aiMessageIndex = prev.length;
           return [...prev, { role: "ai", text: accumulatedText }];
         });
       } else {
-        // Keep updating the SAME bubble as more words stream in
         setMessages((prev) =>
           prev.map((msg, i) =>
             i === aiMessageIndex ? { ...msg, text: accumulatedText } : msg
@@ -242,12 +253,21 @@ export default function Home() {
     <div className="flex flex-col h-screen bg-gray-100">
       <div className="bg-white shadow p-4 flex justify-between items-center">
         <h1 className="text-xl font-semibold">Karan's AI Assistant</h1>
-        <button
-          onClick={openHistory}
-          className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
-        >
-          History
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={startNewChat}
+            className="bg-blue-100 hover:bg-blue-200 text-blue-700 text-sm px-3 py-1.5 rounded-lg"
+            title="Start a fresh conversation (your memory and facts stay intact)"
+          >
+            🆕 New Chat
+          </button>
+          <button
+            onClick={openHistory}
+            className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
+          >
+            History
+          </button>
+        </div>
       </div>
 
       {showHistory && (
@@ -279,6 +299,11 @@ export default function Home() {
       )}
 
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {messages.length === 0 && (
+          <div className="text-center text-gray-400 mt-8">
+            Start a new conversation - your saved memory and facts are still here.
+          </div>
+        )}
         {messages.map((msg, index) => (
           <div
             key={index}

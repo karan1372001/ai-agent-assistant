@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import Optional
 import requests
 import sqlite3
 import re
@@ -43,9 +44,14 @@ CREATE TABLE IF NOT EXISTS history (
 """)
 conn.commit()
 
-for column in ["timestamp", "embedding"]:
+# THE NEW CHAT FIX: adds a "session_id" column so each conversation window
+# can be told apart from the others. Old messages saved before this update
+# will just have an empty session_id, which is fine - they're still fully
+# searchable by the long-term smart memory, just not part of any specific
+# "recent window" anymore.
+for column_name, column_type in [("timestamp", "TEXT"), ("embedding", "TEXT"), ("session_id", "TEXT")]:
     try:
-        cursor.execute(f"ALTER TABLE history ADD COLUMN {column} TEXT")
+        cursor.execute(f"ALTER TABLE history ADD COLUMN {column_name} {column_type}")
         conn.commit()
     except Exception:
         pass
@@ -53,10 +59,12 @@ for column in ["timestamp", "embedding"]:
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: Optional[str] = None
 
 class ImageChatRequest(BaseModel):
     message: str
     image_base64: str
+    session_id: Optional[str] = None
 
 class ApprovalRequest(BaseModel):
     action_id: str
@@ -224,23 +232,11 @@ def open_app(app_name):
         return f"Failed to open {app_name}: {e}"
 
 
-# THE WEBSITE FIX: previously, "open_website(wikipedia)" turned into the
-# broken address "https://wikipedia" (missing ".org"). This maps common
-# site names to their REAL domain, and falls back to guessing ".com" for
-# anything else without a domain ending - much safer than before.
 COMMON_SITES = {
-    "wikipedia": "wikipedia.org",
-    "youtube": "youtube.com",
-    "google": "google.com",
-    "github": "github.com",
-    "amazon": "amazon.com",
-    "reddit": "reddit.com",
-    "twitter": "twitter.com",
-    "x": "x.com",
-    "facebook": "facebook.com",
-    "instagram": "instagram.com",
-    "linkedin": "linkedin.com",
-    "netflix": "netflix.com",
+    "wikipedia": "wikipedia.org", "youtube": "youtube.com", "google": "google.com",
+    "github": "github.com", "amazon": "amazon.com", "reddit": "reddit.com",
+    "twitter": "twitter.com", "x": "x.com", "facebook": "facebook.com",
+    "instagram": "instagram.com", "linkedin": "linkedin.com", "netflix": "netflix.com",
     "gmail": "gmail.com",
 }
 
@@ -250,9 +246,6 @@ def open_website(url):
         url_clean = url.strip()
         if not url_clean.startswith("http"):
             if "." not in url_clean:
-                # No domain ending given at all (e.g. just "wikipedia") -
-                # look it up, or guess ".com" as a safer fallback than
-                # trying to open a broken address with no extension
                 site_key = url_clean.lower()
                 domain = COMMON_SITES.get(site_key, f"{url_clean}.com")
                 url_clean = "https://" + domain
@@ -390,6 +383,9 @@ def cosine_similarity(a, b):
 
 
 def find_relevant_memories(current_message, limit=5):
+    # NOTE: this deliberately searches ALL history, regardless of session -
+    # that's the whole point of long-term memory. "New Chat" only resets
+    # the SHORT-TERM recent window, never this.
     current_embedding = get_embedding(current_message)
     cursor.execute("SELECT role, content, embedding FROM history WHERE embedding IS NOT NULL")
     all_rows = cursor.fetchall()
@@ -404,9 +400,6 @@ def find_relevant_memories(current_message, limit=5):
     return scored[:limit]
 
 
-# THE TOOL-MISUSE FIX: added explicit rules telling the AI to answer
-# general knowledge, trivia, and fun facts directly instead of reaching
-# for a tool it doesn't need.
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools, long-term memory, and computer control.
 
 RULE: To use a tool, respond with ONLY tool lines in this exact format, one per line, nothing else:
@@ -515,7 +508,7 @@ def fake_stream_text(full_text, chunk_size=3, delay=0.02):
         yield buffer
 
 
-def save_message(role, content):
+def save_message(role, content, session_id=None):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         embedding = get_embedding(content)
@@ -523,13 +516,13 @@ def save_message(role, content):
     except Exception:
         embedding_json = None
     cursor.execute(
-        "INSERT INTO history (role, content, timestamp, embedding) VALUES (?, ?, ?, ?)",
-        (role, content, timestamp, embedding_json)
+        "INSERT INTO history (role, content, timestamp, embedding, session_id) VALUES (?, ?, ?, ?, ?)",
+        (role, content, timestamp, embedding_json, session_id)
     )
     conn.commit()
 
 
-def create_permission_request(steps):
+def create_permission_request(steps, session_id=None):
     first_tool_name, first_tool_arg = steps[0]
     remaining_steps = steps[1:]
 
@@ -547,6 +540,7 @@ def create_permission_request(steps):
         "tool_arg": first_tool_arg,
         "content": content_for_file,
         "remaining_steps": remaining_steps,
+        "session_id": session_id,
     }
 
     description = f"{first_tool_name}({first_tool_arg})"
@@ -558,7 +552,7 @@ def create_permission_request(steps):
     else:
         reply = f"I'd like to: {description.replace('_', ' ')}{step_info}. Do you approve this action?"
 
-    save_message("assistant", f"[Requested permission for: {description}]")
+    save_message("assistant", f"[Requested permission for: {description}]", session_id)
 
     return {
         "needs_permission": True,
@@ -583,7 +577,7 @@ def run_single_tool(tool_name, tool_arg, content=None):
         return "Unknown tool"
 
 
-def run_tool_detection_round(ai_reply, messages):
+def run_tool_detection_round(ai_reply, messages, session_id=None):
     for round_number in range(MAX_TOOL_ROUNDS):
         tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
 
@@ -606,7 +600,7 @@ def run_tool_detection_round(ai_reply, messages):
                 tool_results.append(search_web(tool_arg))
 
         if computer_steps:
-            permission_data = create_permission_request(computer_steps)
+            permission_data = create_permission_request(computer_steps, session_id)
             return {"final_reply": None, "permission": permission_data, "messages": messages}
 
         if tool_results:
@@ -622,8 +616,18 @@ def run_tool_detection_round(ai_reply, messages):
     return {"final_reply": cleaned_reply, "permission": None, "messages": messages}
 
 
-def build_chat_messages(user_message):
-    cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6")
+def build_chat_messages(user_message, session_id=None):
+    # THE NEW CHAT FIX: only pull "recent" short-term context from THIS
+    # session, so starting a new chat gives the AI a clean slate for
+    # recency - without touching long-term memory search below, which
+    # still looks across everything, forever.
+    if session_id:
+        cursor.execute(
+            "SELECT role, content FROM history WHERE session_id = ? ORDER BY id DESC LIMIT 6",
+            (session_id,)
+        )
+    else:
+        cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6")
     recent = cursor.fetchall()
     recent.reverse()
 
@@ -654,45 +658,46 @@ def read_root():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    save_message("user", request.message)
+    save_message("user", request.message, request.session_id)
     detect_and_save_facts(request.message)
 
     play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
     if play_match:
         song_name = play_match.group(1)
-        return create_permission_request([("play_youtube", song_name)])
+        return create_permission_request([("play_youtube", song_name)], request.session_id)
 
-    messages = build_chat_messages(request.message)
+    messages = build_chat_messages(request.message, request.session_id)
     ai_reply = ask_ollama_chat(messages)
 
-    result = run_tool_detection_round(ai_reply, messages)
+    result = run_tool_detection_round(ai_reply, messages, request.session_id)
     if result["permission"]:
         return result["permission"]
 
     final_reply = result["final_reply"]
-    save_message("assistant", final_reply)
+    save_message("assistant", final_reply, request.session_id)
     return {"reply": final_reply, "needs_permission": False}
 
 
 @app.post("/chat-stream")
 def chat_stream(request: ChatRequest):
-    save_message("user", request.message)
+    session_id = request.session_id
+    save_message("user", request.message, session_id)
     detect_and_save_facts(request.message)
 
     play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
     if play_match:
         song_name = play_match.group(1)
-        permission_data = create_permission_request([("play_youtube", song_name)])
+        permission_data = create_permission_request([("play_youtube", song_name)], session_id)
 
         def permission_only_stream():
             yield "PERMISSION_JSON:" + json.dumps(permission_data)
 
         return StreamingResponse(permission_only_stream(), media_type="text/plain")
 
-    messages = build_chat_messages(request.message)
+    messages = build_chat_messages(request.message, session_id)
     ai_reply = ask_ollama_chat(messages)
 
-    result = run_tool_detection_round(ai_reply, messages)
+    result = run_tool_detection_round(ai_reply, messages, session_id)
 
     if result["permission"]:
         permission_data = result["permission"]
@@ -712,14 +717,14 @@ def chat_stream(request: ChatRequest):
             for piece in stream_ollama_chat(updated_messages):
                 full_text += piece
                 yield piece
-            save_message("assistant", full_text)
+            save_message("assistant", full_text, session_id)
 
         return StreamingResponse(real_stream(), media_type="text/plain")
     else:
         def replay_stream():
             for piece in fake_stream_text(final_reply):
                 yield piece
-            save_message("assistant", final_reply)
+            save_message("assistant", final_reply, session_id)
 
         return StreamingResponse(replay_stream(), media_type="text/plain")
 
@@ -731,9 +736,11 @@ def approve_action(request: ApprovalRequest):
     if not action:
         return {"reply": "This action has expired or doesn't exist anymore."}
 
+    session_id = action.get("session_id")
+
     if not request.approved:
         del PENDING_ACTIONS[request.action_id]
-        save_message("assistant", "Action was denied by the user. Remaining steps cancelled.")
+        save_message("assistant", "Action was denied by the user. Remaining steps cancelled.", session_id)
         return {"reply": "Okay, I won't do that. I've also cancelled any remaining steps."}
 
     tool_name = action["tool_name"]
@@ -744,10 +751,10 @@ def approve_action(request: ApprovalRequest):
     tool_result = run_single_tool(tool_name, tool_arg, content)
     del PENDING_ACTIONS[request.action_id]
 
-    save_message("assistant", f"Action approved and completed: {tool_result}")
+    save_message("assistant", f"Action approved and completed: {tool_result}", session_id)
 
     if remaining_steps:
-        next_request = create_permission_request(remaining_steps)
+        next_request = create_permission_request(remaining_steps, session_id)
         next_request["reply"] = f"{tool_result}\n\nNext: {next_request['reply']}"
         return next_request
 
@@ -756,7 +763,7 @@ def approve_action(request: ApprovalRequest):
 
 @app.post("/chat-image")
 def chat_image(request: ImageChatRequest):
-    save_message("user", request.message + " [sent an image]")
+    save_message("user", request.message + " [sent an image]", request.session_id)
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={"model": "llava", "prompt": request.message, "images": [request.image_base64], "stream": False}
@@ -765,12 +772,14 @@ def chat_image(request: ImageChatRequest):
     if "response" not in result:
         return {"reply": f"Error from vision model: {result}"}
     ai_reply = result["response"]
-    save_message("assistant", ai_reply)
+    save_message("assistant", ai_reply, request.session_id)
     return {"reply": ai_reply}
 
 
 @app.get("/history")
 def get_history():
+    # Unaffected by "New Chat" - this always shows the FULL log of every
+    # message ever sent, across all sessions, forever.
     cursor.execute("SELECT role, content, timestamp FROM history ORDER BY id ASC")
     rows = cursor.fetchall()
     return {"history": [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]}
