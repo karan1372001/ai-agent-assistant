@@ -102,10 +102,10 @@ export default function Home() {
     setSelectedImage(null);
     setLoading(true);
 
-    let res;
-
+    // Images still go through the original, non-streaming flow - a full
+    // vision-model reply usually arrives in one go anyway.
     if (imageToSend) {
-      res = await fetch("http://127.0.0.1:8000/chat-image", {
+      const res = await fetch("http://127.0.0.1:8000/chat-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -113,26 +113,82 @@ export default function Home() {
           image_base64: imageToSend,
         }),
       });
-    } else {
-      res = await fetch("http://127.0.0.1:8000/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: messageText }),
-      });
+      const data = await res.json();
+      const aiMessage: Message = { role: "ai", text: data.reply };
+      setMessages((prev) => [...prev, aiMessage]);
+      speakText(data.reply);
+      setLoading(false);
+      return;
     }
 
-    const data = await res.json();
+    // THE STREAMING FIX: text messages now hit /chat-stream and the reply
+    // is read progressively, updating the same message bubble as new
+    // words arrive - instead of waiting for the whole answer at once.
+    const res = await fetch("http://127.0.0.1:8000/chat-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: messageText }),
+    });
 
-    const aiMessage: Message = {
-      role: "ai",
-      text: data.reply,
-      actionId: data.action_id,
-      needsApproval: data.needs_permission === true,
-    };
-    setMessages((prev) => [...prev, aiMessage]);
+    if (!res.body) {
+      setLoading(false);
+      return;
+    }
 
-    if (!data.needs_permission) {
-      speakText(data.reply);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulatedText = "";
+    let isPermissionResponse = false;
+    let aiMessageIndex = -1;
+    let firstChunkReceived = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunkText = decoder.decode(value, { stream: true });
+      accumulatedText += chunkText;
+
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+        setLoading(false);
+      }
+
+      if (accumulatedText.startsWith("PERMISSION_JSON:")) {
+        // This is a permission request, not normal streaming text - wait
+        // until the (short) stream fully ends, then parse it as one piece
+        isPermissionResponse = true;
+        continue;
+      }
+
+      if (aiMessageIndex === -1) {
+        // First real chunk of text - create a new AI message bubble
+        setMessages((prev) => {
+          aiMessageIndex = prev.length;
+          return [...prev, { role: "ai", text: accumulatedText }];
+        });
+      } else {
+        // Keep updating the SAME bubble as more words stream in
+        setMessages((prev) =>
+          prev.map((msg, i) =>
+            i === aiMessageIndex ? { ...msg, text: accumulatedText } : msg
+          )
+        );
+      }
+    }
+
+    if (isPermissionResponse) {
+      const jsonText = accumulatedText.replace("PERMISSION_JSON:", "");
+      const data = JSON.parse(jsonText);
+      const aiMessage: Message = {
+        role: "ai",
+        text: data.reply,
+        actionId: data.action_id,
+        needsApproval: data.needs_permission === true,
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+    } else {
+      speakText(accumulatedText);
     }
 
     setLoading(false);
@@ -149,13 +205,10 @@ export default function Home() {
 
     const data = await res.json();
 
-    // Mark the OLD message as no longer needing approval
     setMessages((prev) =>
       prev.map((msg, i) => (i === messageIndex ? { ...msg, needsApproval: false } : msg))
     );
 
-    // Add the result as a NEW message - this might ALSO need approval
-    // if it's the next step in a multi-step chain
     const resultMessage: Message = {
       role: "ai",
       text: data.reply,

@@ -1,13 +1,10 @@
 # =============================================================================
 #  KARAN'S AI ASSISTANT - BACKEND (main.py)
-#  This file runs the "brain" of the assistant: it talks to Ollama (the AI
-#  models running on your own PC), remembers past conversations, can search
-#  the web, can control your computer (with your permission), and understands
-#  images.
 # =============================================================================
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import requests
 import sqlite3
@@ -33,9 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# DATABASE SETUP
-# -----------------------------------------------------------------------------
 conn = sqlite3.connect("memory.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -70,11 +64,6 @@ class ApprovalRequest(BaseModel):
 
 
 PENDING_ACTIONS = {}
-
-
-# =============================================================================
-# FACTS SYSTEM
-# =============================================================================
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS facts (
@@ -115,31 +104,14 @@ def detect_and_save_facts(message):
         save_fact("nickname", nickname_match.group(1).upper())
 
 
-# =============================================================================
-# SIMPLE TOOLS
-# =============================================================================
-
 TIMEZONE_MAP = {
-    "uk": "Europe/London",
-    "united kingdom": "Europe/London",
-    "england": "Europe/London",
-    "london": "Europe/London",
-    "india": "Asia/Kolkata",
-    "usa": "America/New_York",
-    "us": "America/New_York",
-    "united states": "America/New_York",
-    "new york": "America/New_York",
-    "california": "America/Los_Angeles",
-    "los angeles": "America/Los_Angeles",
-    "japan": "Asia/Tokyo",
-    "tokyo": "Asia/Tokyo",
-    "australia": "Australia/Sydney",
-    "sydney": "Australia/Sydney",
-    "dubai": "Asia/Dubai",
-    "uae": "Asia/Dubai",
-    "germany": "Europe/Berlin",
-    "france": "Europe/Paris",
-    "canada": "America/Toronto",
+    "uk": "Europe/London", "united kingdom": "Europe/London", "england": "Europe/London",
+    "london": "Europe/London", "india": "Asia/Kolkata", "usa": "America/New_York",
+    "us": "America/New_York", "united states": "America/New_York", "new york": "America/New_York",
+    "california": "America/Los_Angeles", "los angeles": "America/Los_Angeles",
+    "japan": "Asia/Tokyo", "tokyo": "Asia/Tokyo", "australia": "Australia/Sydney",
+    "sydney": "Australia/Sydney", "dubai": "Asia/Dubai", "uae": "Asia/Dubai",
+    "germany": "Europe/Berlin", "france": "Europe/Paris", "canada": "America/Toronto",
     "singapore": "Asia/Singapore",
 }
 
@@ -153,7 +125,6 @@ def get_time(location=None):
             return now.strftime("%I:%M %p on %B %d, %Y") + f" ({location.strip()} time)"
         else:
             return f"I don't have timezone data for '{location.strip()}' yet, so I can't give an exact local time for it."
-
     return datetime.now().strftime("%I:%M %p on %B %d, %Y") + " (your local time)"
 
 
@@ -187,9 +158,63 @@ def search_web(query):
     return "I searched but couldn't retrieve results right now. Please try again in a moment."
 
 
-# =============================================================================
-# COMPUTER CONTROL TOOLS
-# =============================================================================
+WEATHER_CODES = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+    61: "slight rain", 63: "moderate rain", 65: "heavy rain",
+    71: "slight snow fall", 73: "moderate snow fall", 75: "heavy snow fall",
+    80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+    95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail",
+}
+
+
+def get_weather(location):
+    try:
+        geo_response = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1}
+        )
+        geo_data = geo_response.json()
+
+        if "results" not in geo_data or not geo_data["results"]:
+            return f"I couldn't find a place called '{location}'. Could you check the spelling or try a nearby bigger city/town?"
+
+        place = geo_data["results"][0]
+        lat = place["latitude"]
+        lon = place["longitude"]
+        place_name = place.get("name", location)
+        country = place.get("country", "")
+
+        weather_response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,apparent_temperature",
+                "timezone": "auto",
+            }
+        )
+        weather_data = weather_response.json()
+        current = weather_data.get("current", {})
+
+        temp = current.get("temperature_2m")
+        feels_like = current.get("apparent_temperature")
+        humidity = current.get("relative_humidity_2m")
+        wind = current.get("wind_speed_10m")
+        code = current.get("weather_code")
+        condition = WEATHER_CODES.get(code, "unknown conditions")
+
+        location_label = f"{place_name}, {country}" if country else place_name
+
+        return (
+            f"Current weather in {location_label}: {condition}, "
+            f"temperature {temp}\u00b0C (feels like {feels_like}\u00b0C), "
+            f"humidity {humidity}%, wind speed {wind} km/h."
+        )
+    except Exception as e:
+        return f"Failed to get weather: {e}"
+
 
 def open_app(app_name):
     try:
@@ -198,14 +223,46 @@ def open_app(app_name):
     except Exception as e:
         return f"Failed to open {app_name}: {e}"
 
+
+# THE WEBSITE FIX: previously, "open_website(wikipedia)" turned into the
+# broken address "https://wikipedia" (missing ".org"). This maps common
+# site names to their REAL domain, and falls back to guessing ".com" for
+# anything else without a domain ending - much safer than before.
+COMMON_SITES = {
+    "wikipedia": "wikipedia.org",
+    "youtube": "youtube.com",
+    "google": "google.com",
+    "github": "github.com",
+    "amazon": "amazon.com",
+    "reddit": "reddit.com",
+    "twitter": "twitter.com",
+    "x": "x.com",
+    "facebook": "facebook.com",
+    "instagram": "instagram.com",
+    "linkedin": "linkedin.com",
+    "netflix": "netflix.com",
+    "gmail": "gmail.com",
+}
+
+
 def open_website(url):
     try:
-        if not url.startswith("http"):
-            url = "https://" + url
-        webbrowser.open(url)
-        return f"Opened {url}"
+        url_clean = url.strip()
+        if not url_clean.startswith("http"):
+            if "." not in url_clean:
+                # No domain ending given at all (e.g. just "wikipedia") -
+                # look it up, or guess ".com" as a safer fallback than
+                # trying to open a broken address with no extension
+                site_key = url_clean.lower()
+                domain = COMMON_SITES.get(site_key, f"{url_clean}.com")
+                url_clean = "https://" + domain
+            else:
+                url_clean = "https://" + url_clean
+        webbrowser.open(url_clean)
+        return f"Opened {url_clean}"
     except Exception as e:
         return f"Failed to open website: {e}"
+
 
 def play_youtube(song_name):
     try:
@@ -312,16 +369,8 @@ def create_and_open_file(content, description):
 
 
 COMPUTER_CONTROL_TOOLS = ["open_app", "open_website", "play_youtube", "open_folder", "create_file"]
-
-# THE CHAINING FIX: how many rounds of "AI asks for a tool -> we run it ->
-# AI replies again" we allow in a single request, before giving up. This
-# stops raw, un-executed "TOOL: ..." text from ever reaching your screen.
 MAX_TOOL_ROUNDS = 4
 
-
-# =============================================================================
-# SMART LONG-TERM MEMORY
-# =============================================================================
 
 def get_embedding(text):
     response = requests.post(
@@ -355,10 +404,9 @@ def find_relevant_memories(current_message, limit=5):
     return scored[:limit]
 
 
-# =============================================================================
-# THE AI'S "PERSONALITY" AND INSTRUCTIONS
-# =============================================================================
-
+# THE TOOL-MISUSE FIX: added explicit rules telling the AI to answer
+# general knowledge, trivia, and fun facts directly instead of reaching
+# for a tool it doesn't need.
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools, long-term memory, and computer control.
 
 RULE: To use a tool, respond with ONLY tool lines in this exact format, one per line, nothing else:
@@ -367,16 +415,25 @@ TOOL: tool_name(argument)
 If the user's request needs MULTIPLE actions done in order, output MULTIPLE tool lines, one per line, 
 in the order they should happen.
 
+IMPORTANT: Do NOT use any tool for general knowledge questions, trivia, fun facts, jokes, advice, or
+anything you can simply answer from what you already know. Only use a tool when the request truly
+needs it - real-time info (time/weather/search), math, or an actual action on the computer. For
+example, "tell me a fun fact" should be answered directly with a fact, NOT by opening a website.
+
 Available tools:
 - get_time() -> current date and time where YOU are. get_time(location) -> the accurate current
   time in another place, e.g. get_time(UK) or get_time(India). ALWAYS use this tool for any
-  question about the current time or date, anywhere - NEVER use search_web for time/date questions,
-  since web search results can be old and give the wrong answer.
+  question about the current time or date, anywhere - NEVER use search_web for time/date questions.
+- get_weather(location) -> the REAL current weather (temperature, condition, humidity, wind) for
+  any city/town, e.g. get_weather(Middlesbrough) or get_weather(Mumbai). ALWAYS use this tool for
+  any question about current weather or temperature - NEVER use search_web for weather.
 - calculate(expression) -> basic math
-- search_web(query) -> search the internet for current info (news, facts, weather, etc - NOT for
-  telling the time)
+- search_web(query) -> search the internet for CURRENT/real-time info you don't already know
+  (breaking news, live scores, etc) - NOT for general knowledge, trivia, or facts, and NOT for
+  weather or time, which have their own accurate tools above.
 - open_app(app_name) -> opens an application
-- open_website(url) -> opens a website
+- open_website(url) -> opens a website - only when the user specifically asks to open/visit a site,
+  never as a way to "look something up" or answer a question
 - play_youtube(song_name) -> searches and plays a video on YouTube
 - open_folder(path) -> opens an EXISTING folder to browse files
 - create_file(description) -> writes code/content to a file and opens it in notepad or vscode.
@@ -385,11 +442,17 @@ Available tools:
   description so it gets saved with the right name and in the right place.
 
 Examples:
+User: tell me a fun fact
+You: Did you know honey never spoils? Archaeologists have found 3000-year-old honey in Egyptian tombs that's still edible!
+
 User: open chrome
 You: TOOL: open_app(chrome)
 
 User: what time is it in the UK
 You: TOOL: get_time(UK)
+
+User: what's the weather like in Middlesbrough
+You: TOOL: get_weather(Middlesbrough)
 
 User: play gta 6 trailer on youtube
 You: TOOL: play_youtube(gta 6 trailer)
@@ -419,6 +482,39 @@ def ask_ollama_chat(messages):
     return response.json()["message"]["content"]
 
 
+def stream_ollama_chat(messages):
+    response = requests.post(
+        "http://localhost:11434/api/chat",
+        json={"model": "llama3.1", "messages": messages, "stream": True},
+        stream=True
+    )
+    for line in response.iter_lines():
+        if not line:
+            continue
+        try:
+            chunk = json.loads(line)
+        except Exception:
+            continue
+        piece = chunk.get("message", {}).get("content", "")
+        if piece:
+            yield piece
+        if chunk.get("done"):
+            break
+
+
+def fake_stream_text(full_text, chunk_size=3, delay=0.02):
+    words = full_text.split(" ")
+    buffer = ""
+    for i, word in enumerate(words):
+        buffer += word + (" " if i < len(words) - 1 else "")
+        if (i + 1) % chunk_size == 0:
+            yield buffer
+            buffer = ""
+            time.sleep(delay)
+    if buffer:
+        yield buffer
+
+
 def save_message(role, content):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -432,10 +528,6 @@ def save_message(role, content):
     )
     conn.commit()
 
-
-# =============================================================================
-# PERMISSION SYSTEM
-# =============================================================================
 
 def create_permission_request(steps):
     first_tool_name, first_tool_arg = steps[0]
@@ -491,30 +583,51 @@ def run_single_tool(tool_name, tool_arg, content=None):
         return "Unknown tool"
 
 
-# =============================================================================
-# API ENDPOINTS
-# =============================================================================
+def run_tool_detection_round(ai_reply, messages):
+    for round_number in range(MAX_TOOL_ROUNDS):
+        tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
 
-@app.get("/")
-def read_root():
-    return {"status": "Backend is running"}
+        if not tool_matches:
+            return {"final_reply": ai_reply, "permission": None, "messages": messages}
+
+        computer_steps = []
+        tool_results = []
+
+        for tool_name, tool_arg in tool_matches:
+            if tool_name in COMPUTER_CONTROL_TOOLS:
+                computer_steps.append((tool_name, tool_arg))
+            elif tool_name == "get_time":
+                tool_results.append(get_time(tool_arg.strip() if tool_arg.strip() else None))
+            elif tool_name == "get_weather":
+                tool_results.append(get_weather(tool_arg.strip()))
+            elif tool_name == "calculate":
+                tool_results.append(calculate(tool_arg))
+            elif tool_name == "search_web":
+                tool_results.append(search_web(tool_arg))
+
+        if computer_steps:
+            permission_data = create_permission_request(computer_steps)
+            return {"final_reply": None, "permission": permission_data, "messages": messages}
+
+        if tool_results:
+            messages.append({"role": "assistant", "content": ai_reply})
+            messages.append({"role": "user", "content": f"Tool results: {'; '.join(tool_results)}. Now reply to me naturally using these results."})
+            ai_reply = ask_ollama_chat(messages)
+        else:
+            return {"final_reply": ai_reply, "permission": None, "messages": messages}
+
+    cleaned_reply = re.sub(r"TOOLS?:\s*\w+\(.*?\)\s*", "", ai_reply).strip()
+    if not cleaned_reply:
+        cleaned_reply = "I tried a few different approaches but couldn't get a clean final answer - could you try rephrasing your question?"
+    return {"final_reply": cleaned_reply, "permission": None, "messages": messages}
 
 
-@app.post("/chat")
-def chat(request: ChatRequest):
-    save_message("user", request.message)
-    detect_and_save_facts(request.message)
-
-    play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
-    if play_match:
-        song_name = play_match.group(1)
-        return create_permission_request([("play_youtube", song_name)])
-
+def build_chat_messages(user_message):
     cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6")
     recent = cursor.fetchall()
     recent.reverse()
 
-    relevant = find_relevant_memories(request.message, limit=5)
+    relevant = find_relevant_memories(user_message, limit=5)
     memory_context = ""
 
     facts = get_all_facts()
@@ -531,59 +644,84 @@ def chat(request: ChatRequest):
     messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + memory_context}]
     for role, content in recent:
         messages.append({"role": "user" if role == "user" else "assistant", "content": content})
+    return messages
 
+
+@app.get("/")
+def read_root():
+    return {"status": "Backend is running"}
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    save_message("user", request.message)
+    detect_and_save_facts(request.message)
+
+    play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
+    if play_match:
+        song_name = play_match.group(1)
+        return create_permission_request([("play_youtube", song_name)])
+
+    messages = build_chat_messages(request.message)
     ai_reply = ask_ollama_chat(messages)
 
-    # THE CHAINING FIX: repeat this check up to MAX_TOOL_ROUNDS times, so
-    # if the AI wants to use ANOTHER tool after seeing the first tool's
-    # results (e.g. searching again with better keywords), it actually
-    # gets to run - instead of that request just leaking out as raw,
-    # un-executed "TOOL: ..." text like you saw before.
-    for round_number in range(MAX_TOOL_ROUNDS):
-        tool_matches = re.findall(r"TOOLS?:\s*(\w+)\((.*)\)", ai_reply)
+    result = run_tool_detection_round(ai_reply, messages)
+    if result["permission"]:
+        return result["permission"]
 
-        if not tool_matches:
-            # No tool calls this round - this is a normal, final reply
-            break
+    final_reply = result["final_reply"]
+    save_message("assistant", final_reply)
+    return {"reply": final_reply, "needs_permission": False}
 
-        computer_steps = []
-        tool_results = []
 
-        for tool_name, tool_arg in tool_matches:
-            if tool_name in COMPUTER_CONTROL_TOOLS:
-                computer_steps.append((tool_name, tool_arg))
-            elif tool_name == "get_time":
-                tool_results.append(get_time(tool_arg.strip() if tool_arg.strip() else None))
-            elif tool_name == "calculate":
-                tool_results.append(calculate(tool_arg))
-            elif tool_name == "search_web":
-                tool_results.append(search_web(tool_arg))
+@app.post("/chat-stream")
+def chat_stream(request: ChatRequest):
+    save_message("user", request.message)
+    detect_and_save_facts(request.message)
 
-        if computer_steps:
-            # Computer actions ALWAYS need your permission, no matter which
-            # round of the loop we're on - stop immediately and ask
-            return create_permission_request(computer_steps)
+    play_match = re.search(r"play (.+?) on youtube", request.message, re.IGNORECASE)
+    if play_match:
+        song_name = play_match.group(1)
+        permission_data = create_permission_request([("play_youtube", song_name)])
 
-        if tool_results:
-            messages.append({"role": "assistant", "content": ai_reply})
-            messages.append({"role": "user", "content": f"Tool results: {'; '.join(tool_results)}. Now reply to me naturally using these results."})
-            ai_reply = ask_ollama_chat(messages)
-        else:
-            # Tool calls were found but didn't match any known tool name -
-            # stop here rather than looping forever on something we can't handle
-            break
+        def permission_only_stream():
+            yield "PERMISSION_JSON:" + json.dumps(permission_data)
 
-    # SAFETY NET: if we somehow hit the round limit and there's still a raw
-    # "TOOL: ..." line left in the text, strip it out so you never see
-    # unexecuted tool instructions in the chat
-    cleaned_reply = re.sub(r"TOOLS?:\s*\w+\(.*?\)\s*", "", ai_reply).strip()
-    if cleaned_reply:
-        ai_reply = cleaned_reply
+        return StreamingResponse(permission_only_stream(), media_type="text/plain")
+
+    messages = build_chat_messages(request.message)
+    ai_reply = ask_ollama_chat(messages)
+
+    result = run_tool_detection_round(ai_reply, messages)
+
+    if result["permission"]:
+        permission_data = result["permission"]
+
+        def permission_only_stream():
+            yield "PERMISSION_JSON:" + json.dumps(permission_data)
+
+        return StreamingResponse(permission_only_stream(), media_type="text/plain")
+
+    final_reply = result["final_reply"]
+    updated_messages = result["messages"]
+    tools_were_used = len(updated_messages) > len(messages)
+
+    if tools_were_used:
+        def real_stream():
+            full_text = ""
+            for piece in stream_ollama_chat(updated_messages):
+                full_text += piece
+                yield piece
+            save_message("assistant", full_text)
+
+        return StreamingResponse(real_stream(), media_type="text/plain")
     else:
-        ai_reply = "I tried a few different approaches but couldn't get a clean final answer - could you try rephrasing your question?"
+        def replay_stream():
+            for piece in fake_stream_text(final_reply):
+                yield piece
+            save_message("assistant", final_reply)
 
-    save_message("assistant", ai_reply)
-    return {"reply": ai_reply, "needs_permission": False}
+        return StreamingResponse(replay_stream(), media_type="text/plain")
 
 
 @app.post("/approve-action")
