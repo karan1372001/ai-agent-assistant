@@ -17,10 +17,12 @@ import os
 import webbrowser
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from ddgs import DDGS
 import pywhatkit
+import dateparser
+from dateparser.search import search_dates
 
 app = FastAPI()
 
@@ -31,9 +33,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-conn = sqlite3.connect("memory.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
+DB_PATH = "memory.db"
+
+
+def db_execute(sql, params=(), fetch=None, commit=False):
+    local_conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+    local_conn.execute("PRAGMA journal_mode=WAL")
+    local_cursor = local_conn.cursor()
+    local_cursor.execute(sql, params)
+    result = None
+    if fetch == "one":
+        result = local_cursor.fetchone()
+    elif fetch == "all":
+        result = local_cursor.fetchall()
+    if commit:
+        local_conn.commit()
+    local_conn.close()
+    return result
+
+
+_startup_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_startup_cursor = _startup_conn.cursor()
+
+_startup_cursor.execute("""
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role TEXT,
@@ -42,19 +64,45 @@ CREATE TABLE IF NOT EXISTS history (
     embedding TEXT
 )
 """)
-conn.commit()
+_startup_conn.commit()
 
-# THE NEW CHAT FIX: adds a "session_id" column so each conversation window
-# can be told apart from the others. Old messages saved before this update
-# will just have an empty session_id, which is fine - they're still fully
-# searchable by the long-term smart memory, just not part of any specific
-# "recent window" anymore.
 for column_name, column_type in [("timestamp", "TEXT"), ("embedding", "TEXT"), ("session_id", "TEXT")]:
     try:
-        cursor.execute(f"ALTER TABLE history ADD COLUMN {column_name} {column_type}")
-        conn.commit()
+        _startup_cursor.execute(f"ALTER TABLE history ADD COLUMN {column_name} {column_type}")
+        _startup_conn.commit()
     except Exception:
         pass
+
+_startup_cursor.execute("""
+CREATE TABLE IF NOT EXISTS facts (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+_startup_conn.commit()
+
+_startup_cursor.execute("""
+CREATE TABLE IF NOT EXISTS trusted_actions (
+    tool_name TEXT,
+    tool_arg_key TEXT,
+    approval_count INTEGER,
+    PRIMARY KEY (tool_name, tool_arg_key)
+)
+""")
+_startup_conn.commit()
+
+_startup_cursor.execute("""
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message TEXT,
+    remind_at TEXT,
+    created_at TEXT,
+    session_id TEXT,
+    notified INTEGER DEFAULT 0
+)
+""")
+_startup_conn.commit()
+_startup_conn.close()
 
 
 class ChatRequest(BaseModel):
@@ -70,26 +118,59 @@ class ApprovalRequest(BaseModel):
     action_id: str
     approved: bool
 
+class DeleteReminderRequest(BaseModel):
+    id: int
+
 
 PENDING_ACTIONS = {}
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS facts (
-    key TEXT PRIMARY KEY,
-    value TEXT
-)
-""")
-conn.commit()
+TRUSTABLE_TOOLS = ["open_app", "open_website", "open_folder"]
+APPROVAL_THRESHOLD = 3
+
+
+def normalize_action_key(tool_arg):
+    return tool_arg.strip().lower()
+
+
+def get_approval_count(tool_name, tool_arg):
+    key = normalize_action_key(tool_arg)
+    row = db_execute(
+        "SELECT approval_count FROM trusted_actions WHERE tool_name = ? AND tool_arg_key = ?",
+        (tool_name, key), fetch="one"
+    )
+    return row[0] if row else 0
+
+
+def increment_approval_count(tool_name, tool_arg):
+    key = normalize_action_key(tool_arg)
+    row = db_execute(
+        "SELECT approval_count FROM trusted_actions WHERE tool_name = ? AND tool_arg_key = ?",
+        (tool_name, key), fetch="one"
+    )
+    if row:
+        db_execute(
+            "UPDATE trusted_actions SET approval_count = approval_count + 1 WHERE tool_name = ? AND tool_arg_key = ?",
+            (tool_name, key), commit=True
+        )
+    else:
+        db_execute(
+            "INSERT INTO trusted_actions (tool_name, tool_arg_key, approval_count) VALUES (?, ?, 1)",
+            (tool_name, key), commit=True
+        )
+
+
+def is_trusted(tool_name, tool_arg):
+    if tool_name not in TRUSTABLE_TOOLS:
+        return False
+    return get_approval_count(tool_name, tool_arg) >= APPROVAL_THRESHOLD
 
 
 def save_fact(key, value):
-    cursor.execute("INSERT OR REPLACE INTO facts (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
+    db_execute("INSERT OR REPLACE INTO facts (key, value) VALUES (?, ?)", (key, value), commit=True)
 
 
 def get_all_facts():
-    cursor.execute("SELECT key, value FROM facts")
-    return cursor.fetchall()
+    return db_execute("SELECT key, value FROM facts", fetch="all") or []
 
 
 def detect_and_save_facts(message):
@@ -222,6 +303,97 @@ def get_weather(location):
         )
     except Exception as e:
         return f"Failed to get weather: {e}"
+
+
+def normalize_time_text(text):
+    text = re.sub(r'(\d{1,2})\.(\d{2})\s*(am|pm)', r'\1:\2 \3', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bafter\s+(\d+)', r'in \1', text, flags=re.IGNORECASE)
+    return text
+
+
+def parse_clock_time_directly(text):
+    """
+    THE RELIABLE TIME FIX: handles the most common reminder phrasing
+    ourselves with simple, guaranteed-correct logic - an explicit clock
+    time like "5pm", "01:06 PM", "9:30 am". This bypasses the flexible
+    date-parsing library entirely for this case, since it was
+    occasionally misreading times like "01:06 PM" as a date days or
+    even years in the future instead of just "today (or tomorrow) at
+    that time". Returns (datetime, matched_text) or (None, None).
+    """
+    match = re.search(r'\b(\d{1,2}):?(\d{2})?\s*(am|pm)\b', text, re.IGNORECASE)
+    if not match:
+        return None, None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
+    meridiem = match.group(3).lower()
+
+    if hour == 12:
+        hour = 0
+    if meridiem == "pm":
+        hour += 12
+
+    now = datetime.now()
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+
+    return candidate, match.group(0)
+
+
+def clean_reminder_message(text, matched_text):
+    message = text.replace(matched_text, "")
+    message = re.sub(r'\bat\s*$', '', message, flags=re.IGNORECASE)
+    message = re.sub(r'^(to|that|about|for|me to)\s+', '', message, flags=re.IGNORECASE).strip()
+    message = re.sub(r'\s+(to|that|about|at)$', '', message, flags=re.IGNORECASE).strip()
+    message = re.sub(r'^(i am going to sleep,?\s*|wake me( up)?\s*)', '', message, flags=re.IGNORECASE).strip()
+    message = message.strip(" ,.-\"'")
+    if not message:
+        message = "Wake up / reminder"
+    return message
+
+
+def parse_reminder(description):
+    cleaned = normalize_time_text(description)
+
+    # First, try our own simple/reliable direct match for explicit clock
+    # times - this is the most common case and the one that was breaking.
+    direct_time, matched_text = parse_clock_time_directly(cleaned)
+    if direct_time:
+        message = clean_reminder_message(cleaned, matched_text)
+        return direct_time, message
+
+    # Fall back to the flexible parser for everything else (relative
+    # times like "in 5 minutes", "tomorrow", specific dates, etc.)
+    results = search_dates(
+        cleaned,
+        settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False}
+    )
+    if not results:
+        return None, description
+
+    matched_text, remind_at = results[0]
+    message = clean_reminder_message(cleaned, matched_text)
+    return remind_at, message
+
+
+def set_reminder(description, session_id=None):
+    remind_at, message = parse_reminder(description)
+    if not remind_at:
+        return ("I couldn't figure out WHEN to remind you - try something like "
+                "'remind me at 5pm to call mom' or 'remind me in 30 minutes to check the oven'.")
+
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    remind_at_str = remind_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    db_execute(
+        "INSERT INTO reminders (message, remind_at, created_at, session_id, notified) VALUES (?, ?, ?, ?, 0)",
+        (message, remind_at_str, created_at, session_id), commit=True
+    )
+
+    friendly_time = remind_at.strftime("%I:%M %p on %B %d, %Y")
+    return f'Got it - I\'ll remind you to "{message}" at {friendly_time}.'
 
 
 def open_app(app_name):
@@ -383,12 +555,8 @@ def cosine_similarity(a, b):
 
 
 def find_relevant_memories(current_message, limit=5):
-    # NOTE: this deliberately searches ALL history, regardless of session -
-    # that's the whole point of long-term memory. "New Chat" only resets
-    # the SHORT-TERM recent window, never this.
     current_embedding = get_embedding(current_message)
-    cursor.execute("SELECT role, content, embedding FROM history WHERE embedding IS NOT NULL")
-    all_rows = cursor.fetchall()
+    all_rows = db_execute("SELECT role, content, embedding FROM history WHERE embedding IS NOT NULL", fetch="all") or []
     scored = []
     for role, content, embedding_json in all_rows:
         if not embedding_json:
@@ -410,8 +578,7 @@ in the order they should happen.
 
 IMPORTANT: Do NOT use any tool for general knowledge questions, trivia, fun facts, jokes, advice, or
 anything you can simply answer from what you already know. Only use a tool when the request truly
-needs it - real-time info (time/weather/search), math, or an actual action on the computer. For
-example, "tell me a fun fact" should be answered directly with a fact, NOT by opening a website.
+needs it - real-time info (time/weather/search), math, reminders, or an actual action on the computer.
 
 Available tools:
 - get_time() -> current date and time where YOU are. get_time(location) -> the accurate current
@@ -422,11 +589,12 @@ Available tools:
   any question about current weather or temperature - NEVER use search_web for weather.
 - calculate(expression) -> basic math
 - search_web(query) -> search the internet for CURRENT/real-time info you don't already know
-  (breaking news, live scores, etc) - NOT for general knowledge, trivia, or facts, and NOT for
-  weather or time, which have their own accurate tools above.
+  (breaking news, live scores, etc) - NOT for general knowledge, trivia, or facts.
+- set_reminder(description) -> creates a reminder. The description MUST include both WHAT to
+  remind about and WHEN, in natural language, e.g. set_reminder(call mom at 5pm) or
+  set_reminder(check the oven in 30 minutes) or set_reminder(wake me up in 5 minutes).
 - open_app(app_name) -> opens an application
-- open_website(url) -> opens a website - only when the user specifically asks to open/visit a site,
-  never as a way to "look something up" or answer a question
+- open_website(url) -> opens a website - only when the user specifically asks to open/visit a site
 - play_youtube(song_name) -> searches and plays a video on YouTube
 - open_folder(path) -> opens an EXISTING folder to browse files
 - create_file(description) -> writes code/content to a file and opens it in notepad or vscode.
@@ -446,6 +614,12 @@ You: TOOL: get_time(UK)
 
 User: what's the weather like in Middlesbrough
 You: TOOL: get_weather(Middlesbrough)
+
+User: remind me at 5pm to call mom
+You: TOOL: set_reminder(call mom at 5pm)
+
+User: wake me up in 5 minutes
+You: TOOL: set_reminder(wake me up in 5 minutes)
 
 User: play gta 6 trailer on youtube
 You: TOOL: play_youtube(gta 6 trailer)
@@ -515,11 +689,10 @@ def save_message(role, content, session_id=None):
         embedding_json = json.dumps(embedding)
     except Exception:
         embedding_json = None
-    cursor.execute(
+    db_execute(
         "INSERT INTO history (role, content, timestamp, embedding, session_id) VALUES (?, ?, ?, ?, ?)",
-        (role, content, timestamp, embedding_json, session_id)
+        (role, content, timestamp, embedding_json, session_id), commit=True
     )
-    conn.commit()
 
 
 def create_permission_request(steps, session_id=None):
@@ -598,10 +771,32 @@ def run_tool_detection_round(ai_reply, messages, session_id=None):
                 tool_results.append(calculate(tool_arg))
             elif tool_name == "search_web":
                 tool_results.append(search_web(tool_arg))
+            elif tool_name == "set_reminder":
+                tool_results.append(set_reminder(tool_arg.strip(), session_id))
 
         if computer_steps:
-            permission_data = create_permission_request(computer_steps, session_id)
-            return {"final_reply": None, "permission": permission_data, "messages": messages}
+            auto_run_results = []
+            remaining_computer_steps = list(computer_steps)
+
+            while remaining_computer_steps:
+                next_tool_name, next_tool_arg = remaining_computer_steps[0]
+                if is_trusted(next_tool_name, next_tool_arg):
+                    result = run_single_tool(next_tool_name, next_tool_arg)
+                    auto_run_results.append(f"{next_tool_name}({next_tool_arg}): {result}")
+                    save_message("assistant", f"Auto-approved (trusted action): {result}", session_id)
+                    remaining_computer_steps.pop(0)
+                else:
+                    break
+
+            if remaining_computer_steps:
+                permission_data = create_permission_request(remaining_computer_steps, session_id)
+                if auto_run_results:
+                    permission_data["reply"] = "\n".join(auto_run_results) + "\n\n" + permission_data["reply"]
+                return {"final_reply": None, "permission": permission_data, "messages": messages}
+            else:
+                final_text = "\n".join(auto_run_results)
+                save_message("assistant", final_text, session_id)
+                return {"final_reply": final_text, "permission": None, "messages": messages}
 
         if tool_results:
             messages.append({"role": "assistant", "content": ai_reply})
@@ -617,18 +812,14 @@ def run_tool_detection_round(ai_reply, messages, session_id=None):
 
 
 def build_chat_messages(user_message, session_id=None):
-    # THE NEW CHAT FIX: only pull "recent" short-term context from THIS
-    # session, so starting a new chat gives the AI a clean slate for
-    # recency - without touching long-term memory search below, which
-    # still looks across everything, forever.
     if session_id:
-        cursor.execute(
+        recent = db_execute(
             "SELECT role, content FROM history WHERE session_id = ? ORDER BY id DESC LIMIT 6",
-            (session_id,)
-        )
+            (session_id,), fetch="all"
+        ) or []
     else:
-        cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6")
-    recent = cursor.fetchall()
+        recent = db_execute("SELECT role, content FROM history ORDER BY id DESC LIMIT 6", fetch="all") or []
+    recent = list(recent)
     recent.reverse()
 
     relevant = find_relevant_memories(user_message, limit=5)
@@ -651,6 +842,12 @@ def build_chat_messages(user_message, session_id=None):
     return messages
 
 
+def try_direct_reminder(message):
+    if re.search(r"\b(remind me|wake me( up)?|don'?t let me forget)\b", message, re.IGNORECASE):
+        return set_reminder(message)
+    return None
+
+
 @app.get("/")
 def read_root():
     return {"status": "Backend is running"}
@@ -665,6 +862,11 @@ def chat(request: ChatRequest):
     if play_match:
         song_name = play_match.group(1)
         return create_permission_request([("play_youtube", song_name)], request.session_id)
+
+    reminder_reply = try_direct_reminder(request.message)
+    if reminder_reply:
+        save_message("assistant", reminder_reply, request.session_id)
+        return {"reply": reminder_reply, "needs_permission": False}
 
     messages = build_chat_messages(request.message, request.session_id)
     ai_reply = ask_ollama_chat(messages)
@@ -693,6 +895,15 @@ def chat_stream(request: ChatRequest):
             yield "PERMISSION_JSON:" + json.dumps(permission_data)
 
         return StreamingResponse(permission_only_stream(), media_type="text/plain")
+
+    reminder_reply = try_direct_reminder(request.message)
+    if reminder_reply:
+        def reminder_stream():
+            for piece in fake_stream_text(reminder_reply):
+                yield piece
+            save_message("assistant", reminder_reply, session_id)
+
+        return StreamingResponse(reminder_stream(), media_type="text/plain")
 
     messages = build_chat_messages(request.message, session_id)
     ai_reply = ask_ollama_chat(messages)
@@ -751,6 +962,9 @@ def approve_action(request: ApprovalRequest):
     tool_result = run_single_tool(tool_name, tool_arg, content)
     del PENDING_ACTIONS[request.action_id]
 
+    if tool_name in TRUSTABLE_TOOLS:
+        increment_approval_count(tool_name, tool_arg)
+
     save_message("assistant", f"Action approved and completed: {tool_result}", session_id)
 
     if remaining_steps:
@@ -778,8 +992,55 @@ def chat_image(request: ImageChatRequest):
 
 @app.get("/history")
 def get_history():
-    # Unaffected by "New Chat" - this always shows the FULL log of every
-    # message ever sent, across all sessions, forever.
-    cursor.execute("SELECT role, content, timestamp FROM history ORDER BY id ASC")
-    rows = cursor.fetchall()
+    rows = db_execute("SELECT role, content, timestamp FROM history ORDER BY id ASC", fetch="all") or []
     return {"history": [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]}
+
+
+@app.get("/trusted-actions")
+def get_trusted_actions():
+    rows = db_execute(
+        "SELECT tool_name, tool_arg_key, approval_count FROM trusted_actions ORDER BY approval_count DESC",
+        fetch="all"
+    ) or []
+    return {
+        "trusted_actions": [
+            {"tool_name": r[0], "action": r[1], "approval_count": r[2], "is_trusted": r[2] >= APPROVAL_THRESHOLD}
+            for r in rows
+        ],
+        "threshold": APPROVAL_THRESHOLD,
+    }
+
+
+@app.get("/reminders")
+def get_reminders():
+    rows = db_execute(
+        "SELECT id, message, remind_at, created_at, notified FROM reminders ORDER BY remind_at ASC",
+        fetch="all"
+    ) or []
+    return {
+        "reminders": [
+            {"id": r[0], "message": r[1], "remind_at": r[2], "created_at": r[3], "notified": bool(r[4])}
+            for r in rows
+        ]
+    }
+
+
+@app.get("/reminders/due")
+def get_due_reminders():
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = db_execute(
+        "SELECT id, message, remind_at FROM reminders WHERE remind_at <= ? AND notified = 0",
+        (now_str,), fetch="all"
+    ) or []
+    due = [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in rows]
+    if due:
+        ids = [r["id"] for r in due]
+        placeholders = ",".join("?" * len(ids))
+        db_execute(f"UPDATE reminders SET notified = 1 WHERE id IN ({placeholders})", tuple(ids), commit=True)
+    return {"due": due}
+
+
+@app.post("/reminders/delete")
+def delete_reminder(request: DeleteReminderRequest):
+    db_execute("DELETE FROM reminders WHERE id = ?", (request.id,), commit=True)
+    return {"success": True}

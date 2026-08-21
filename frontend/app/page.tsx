@@ -15,12 +15,22 @@ type HistoryItem = {
   timestamp: string;
 };
 
+type ReminderItem = {
+  id: number;
+  message: string;
+  remind_at: string;
+  created_at: string;
+  notified: boolean;
+};
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showReminders, setShowReminders] = useState(false);
+  const [reminders, setReminders] = useState<ReminderItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [sessionId, setSessionId] = useState<string>("");
@@ -59,6 +69,35 @@ export default function Home() {
     }
   }, []);
 
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch("http://127.0.0.1:8000/reminders/due");
+        const data = await res.json();
+        if (data.due && data.due.length > 0) {
+          for (const reminder of data.due) {
+            const text = `⏰ Reminder: ${reminder.message}`;
+            setMessages((prev) => [...prev, { role: "ai", text }]);
+
+            if ("Notification" in window && Notification.permission === "granted") {
+              new Notification("AI Assistant Reminder", { body: reminder.message });
+            }
+
+            speakText(text);
+          }
+        }
+      } catch (e) {
+        // Backend might be momentarily unreachable - just skip this check
+      }
+    }, 20000);
+
+    return () => clearInterval(interval);
+  }, []);
+
   function startListening() {
     if (recognitionRef.current) {
       setIsListening(true);
@@ -95,9 +134,6 @@ export default function Home() {
     setSessionId(crypto.randomUUID());
   }
 
-  // THE EXPORT FIX: pulls your full chat history from the backend, turns
-  // it into a clean, readable text file, and triggers a normal browser
-  // download - like clicking "Save As" on a document.
   async function exportHistory() {
     const res = await fetch("http://127.0.0.1:8000/history");
     const data = await res.json();
@@ -129,6 +165,22 @@ export default function Home() {
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+  }
+
+  async function openReminders() {
+    const res = await fetch("http://127.0.0.1:8000/reminders");
+    const data = await res.json();
+    setReminders(data.reminders);
+    setShowReminders(true);
+  }
+
+  async function deleteReminder(id: number) {
+    await fetch("http://127.0.0.1:8000/reminders/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    setReminders((prev) => prev.filter((r) => r.id !== id));
   }
 
   async function sendMessage() {
@@ -289,6 +341,12 @@ export default function Home() {
             🆕 New Chat
           </button>
           <button
+            onClick={openReminders}
+            className="bg-yellow-100 hover:bg-yellow-200 text-yellow-800 text-sm px-3 py-1.5 rounded-lg"
+          >
+            🔔 Reminders
+          </button>
+          <button
             onClick={openHistory}
             className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
           >
@@ -334,6 +392,48 @@ export default function Home() {
                 <div className="text-xs text-gray-400 whitespace-nowrap">
                   {item.timestamp}
                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showReminders && (
+        <div className="absolute inset-0 bg-white z-10 flex flex-col">
+          <div className="p-4 bg-white shadow flex justify-between items-center">
+            <h2 className="text-lg font-semibold">Reminders</h2>
+            <button
+              onClick={() => setShowReminders(false)}
+              className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
+            >
+              Close
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-2">
+            {reminders.length === 0 && (
+              <p className="text-gray-500">
+                No reminders yet. Try saying "remind me at 5pm to call mom".
+              </p>
+            )}
+            {reminders.map((item) => (
+              <div
+                key={item.id}
+                className={`border rounded-lg p-3 flex justify-between items-start gap-4 ${
+                  item.notified ? "bg-gray-50 text-gray-400" : "bg-yellow-50"
+                }`}
+              >
+                <div>
+                  <div className="font-medium">{item.message}</div>
+                  <div className="text-xs mt-1">
+                    {item.notified ? "Already reminded at" : "Will remind at"}: {item.remind_at}
+                  </div>
+                </div>
+                <button
+                  onClick={() => deleteReminder(item.id)}
+                  className="text-red-500 hover:text-red-700 text-sm"
+                >
+                  ✕
+                </button>
               </div>
             ))}
           </div>
