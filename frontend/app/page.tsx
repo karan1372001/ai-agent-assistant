@@ -23,17 +23,12 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
-  // THE NEW CHAT FIX: a unique ID for the CURRENT conversation window.
-  // The AI only looks at recent messages sharing this ID for short-term
-  // context - clicking "New Chat" swaps this out for a brand new one,
-  // giving a clean slate without touching any saved memory or facts.
   const [sessionId, setSessionId] = useState<string>("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
-    // Give this browser tab a starting session ID as soon as it loads
     setSessionId(crypto.randomUUID());
   }, []);
 
@@ -96,12 +91,44 @@ export default function Home() {
   }
 
   function startNewChat() {
-    // Clears the visible conversation and starts a fresh session ID.
-    // Nothing is deleted from memory.db - your facts and long-term
-    // memories are still fully intact and searchable, this just gives
-    // the AI a clean "recent context" window to start from.
     setMessages([]);
     setSessionId(crypto.randomUUID());
+  }
+
+  // THE EXPORT FIX: pulls your full chat history from the backend, turns
+  // it into a clean, readable text file, and triggers a normal browser
+  // download - like clicking "Save As" on a document.
+  async function exportHistory() {
+    const res = await fetch("http://127.0.0.1:8000/history");
+    const data = await res.json();
+    const items: HistoryItem[] = data.history;
+
+    if (!items || items.length === 0) {
+      alert("There's no chat history to export yet.");
+      return;
+    }
+
+    let fileContent = "KARAN'S AI ASSISTANT - CHAT HISTORY EXPORT\n";
+    fileContent += `Exported on: ${new Date().toLocaleString()}\n`;
+    fileContent += `Total messages: ${items.length}\n`;
+    fileContent += "=".repeat(50) + "\n\n";
+
+    for (const item of items) {
+      const speaker = item.role === "user" ? "You" : "AI Assistant";
+      fileContent += `[${item.timestamp}] ${speaker}:\n${item.content}\n\n`;
+    }
+
+    const blob = new Blob([fileContent], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const dateStamp = new Date().toISOString().split("T")[0];
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ai-assistant-chat-history-${dateStamp}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
   async function sendMessage() {
@@ -267,6 +294,13 @@ export default function Home() {
           >
             History
           </button>
+          <button
+            onClick={exportHistory}
+            className="bg-green-100 hover:bg-green-200 text-green-700 text-sm px-3 py-1.5 rounded-lg"
+            title="Download your full chat history as a text file"
+          >
+            ⬇️ Export
+          </button>
         </div>
       </div>
 
@@ -274,12 +308,20 @@ export default function Home() {
         <div className="absolute inset-0 bg-white z-10 flex flex-col">
           <div className="p-4 bg-white shadow flex justify-between items-center">
             <h2 className="text-lg font-semibold">Chat History</h2>
-            <button
-              onClick={() => setShowHistory(false)}
-              className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
-            >
-              Close
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={exportHistory}
+                className="bg-green-100 hover:bg-green-200 text-green-700 text-sm px-3 py-1.5 rounded-lg"
+              >
+                ⬇️ Export
+              </button>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1.5 rounded-lg"
+              >
+                Close
+              </button>
+            </div>
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-2">
             {history.length === 0 && <p className="text-gray-500">No history yet.</p>}
