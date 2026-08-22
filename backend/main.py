@@ -202,6 +202,23 @@ def detect_and_save_facts(message):
     if nickname_match:
         save_fact("nickname", nickname_match.group(1).upper())
 
+    boss_match = re.search(r"\bi am your boss\b|\byou work for me\b", message_lower)
+    if boss_match:
+        save_fact("relationship", "The user is my boss.")
+
+    # THE ASSISTANT NAME FIX: previously, renaming the AI (e.g. "your name
+    # is Jarvis") was never saved as a real, permanent fact - it only
+    # seemed to work because of the fuzzy long-term memory search finding
+    # it by luck, which isn't reliable and can eventually stop working.
+    # This makes it a guaranteed fact, exactly like your own name.
+    assistant_name_match = re.search(
+        r"(?:from now on[, ]+)?your name is (\w+)|i(?:'ll| will) call you (\w+)|call yourself (\w+)",
+        message_lower
+    )
+    if assistant_name_match:
+        new_name = next(g for g in assistant_name_match.groups() if g)
+        save_fact("assistant_name", new_name.capitalize())
+
 
 TIMEZONE_MAP = {
     "uk": "Europe/London", "united kingdom": "Europe/London", "england": "Europe/London",
@@ -345,9 +362,16 @@ def parse_clock_time_directly(text):
 
 def clean_reminder_message(text, matched_text):
     message = text.replace(matched_text, "")
+    # THE REMINDER TEXT FIX: strip common leading/trailing filler words
+    # more thoroughly, including leftover "remind me", "to", "in", numbers
+    # and time-unit words ("min", "minutes") that used to linger after
+    # removing just the clock time itself.
     message = re.sub(r'\bat\s*$', '', message, flags=re.IGNORECASE)
+    message = re.sub(r'^(remind me( to)?|to remind me( to)?)\s+', '', message, flags=re.IGNORECASE).strip()
     message = re.sub(r'^(to|that|about|for|me to)\s+', '', message, flags=re.IGNORECASE).strip()
-    message = re.sub(r'\s+(to|that|about|at)$', '', message, flags=re.IGNORECASE).strip()
+    message = re.sub(r'\s+(to|that|about|at|in)$', '', message, flags=re.IGNORECASE).strip()
+    message = re.sub(r'\s+in\s+next\s*$', '', message, flags=re.IGNORECASE).strip()
+    message = re.sub(r'\s+in\s+\d+\s*(min|mins|minute|minutes|hour|hours)?\s*$', '', message, flags=re.IGNORECASE).strip()
     message = re.sub(r'^(i am going to sleep,?\s*|wake me( up)?\s*)', '', message, flags=re.IGNORECASE).strip()
     message = message.strip(" ,.-\"'")
     if not message:
@@ -393,10 +417,6 @@ def set_reminder(description, session_id=None):
     return f'Got it - I\'ll remind you to "{message}" at {friendly_time}.'
 
 
-# THE APP-NAME FIX: Windows doesn't recognize friendly names like "vscode"
-# or "word" as launchable programs - it needs their actual command-line
-# names ("code", "winword"). This maps common nicknames to what Windows
-# actually understands, the same trick already used for website names.
 COMMON_APPS = {
     "vscode": "code",
     "vs code": "code",
@@ -670,8 +690,7 @@ Available tools:
   or a folder path (e.g. "E:\\MyFolder"), include that exact wording in the
   description so it gets saved with the right name and in the right place. If the user wants it
   opened in VS Code, include "vscode" or "vs code" in the description too, in the SAME tool call
-  as create_file - do not use a separate open_app step for this, since create_file already opens
-  the file in the right program itself.
+  as create_file - do not use a separate open_app step for this.
 
 Examples:
 User: tell me a fun fact
@@ -893,12 +912,33 @@ def build_chat_messages(user_message, session_id=None):
     recent.reverse()
 
     relevant = find_relevant_memories(user_message, limit=5)
-    memory_context = ""
 
+    # THE JARVIS FIX: separate out the assistant's own name from the rest
+    # of the facts, and inject it as a clear, direct instruction at the
+    # very top of the system prompt - guaranteed to be included every
+    # single time, in every new chat, forever (not dependent on fuzzy
+    # memory search finding it by chance).
     facts = get_all_facts()
-    if facts:
+    assistant_name = None
+    user_facts = []
+    for key, value in facts:
+        if key == "assistant_name":
+            assistant_name = value
+        else:
+            user_facts.append((key, value))
+
+    identity_prefix = ""
+    if assistant_name:
+        identity_prefix = (
+            f"Your name is {assistant_name}. Whenever asked your name, or referring to "
+            f"yourself, ALWAYS use {assistant_name} - this is permanent and never changes "
+            f"unless the user explicitly renames you again.\n\n"
+        )
+
+    memory_context = ""
+    if user_facts:
         memory_context += "Known facts about the user (ALWAYS remember these, never forget):\n"
-        for key, value in facts:
+        for key, value in user_facts:
             memory_context += f"- {key.replace('_', ' ')}: {value}\n"
 
     if relevant:
@@ -906,7 +946,7 @@ def build_chat_messages(user_message, session_id=None):
         for score, role, content in relevant:
             memory_context += f"- {role}: {content}\n"
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + memory_context}]
+    messages = [{"role": "system", "content": identity_prefix + SYSTEM_PROMPT + "\n" + memory_context}]
     for role, content in recent:
         messages.append({"role": "user" if role == "user" else "assistant", "content": content})
     return messages
