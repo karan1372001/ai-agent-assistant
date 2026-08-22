@@ -5,6 +5,7 @@ type Message = {
   role: "user" | "ai";
   text: string;
   image?: string;
+  documentName?: string;
   actionId?: string;
   needsApproval?: boolean;
 };
@@ -32,10 +33,12 @@ export default function Home() {
   const [showReminders, setShowReminders] = useState(false);
   const [reminders, setReminders] = useState<ReminderItem[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [selectedDocument, setSelectedDocument] = useState<{ name: string; base64: string } | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [sessionId, setSessionId] = useState<string>("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
@@ -129,6 +132,32 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
+  // THE DOCUMENT UPLOAD FIX: same idea as image attaching, but for PDF,
+  // Word, and text files. Converts the chosen file to base64 so it can
+  // be sent to the backend, where the actual text gets extracted.
+  function handleDocumentClick() {
+    documentInputRef.current?.click();
+  }
+
+  function handleDocumentChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const allowedExtensions = [".pdf", ".docx", ".txt"];
+    const lowerName = file.name.toLowerCase();
+    if (!allowedExtensions.some((ext) => lowerName.endsWith(ext))) {
+      alert("Please choose a .pdf, .docx, or .txt file.");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64String = (reader.result as string).split(",")[1];
+      setSelectedDocument({ name: file.name, base64: base64String });
+    };
+    reader.readAsDataURL(file);
+  }
+
   function startNewChat() {
     setMessages([]);
     setSessionId(crypto.randomUUID());
@@ -184,7 +213,43 @@ export default function Home() {
   }
 
   async function sendMessage() {
-    if (!input.trim() && !selectedImage) return;
+    if (!input.trim() && !selectedImage && !selectedDocument) return;
+
+    // Document messages are handled separately, non-streamed (same
+    // pattern as images) since they go through their own dedicated
+    // endpoint that extracts text first.
+    if (selectedDocument) {
+      const userMessage: Message = {
+        role: "user",
+        text: input || `What can you tell me about ${selectedDocument.name}?`,
+        documentName: selectedDocument.name,
+      };
+      setMessages((prev) => [...prev, userMessage]);
+
+      const messageText = input;
+      const docToSend = selectedDocument;
+
+      setInput("");
+      setSelectedDocument(null);
+      setLoading(true);
+
+      const res = await fetch("http://127.0.0.1:8000/chat-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: messageText || `What can you tell me about ${docToSend.name}?`,
+          filename: docToSend.name,
+          file_base64: docToSend.base64,
+          session_id: sessionId,
+        }),
+      });
+      const data = await res.json();
+      const aiMessage: Message = { role: "ai", text: data.reply };
+      setMessages((prev) => [...prev, aiMessage]);
+      speakText(data.reply);
+      setLoading(false);
+      return;
+    }
 
     const userMessage: Message = {
       role: "user",
@@ -465,6 +530,15 @@ export default function Home() {
                   className="rounded-lg mb-2 max-w-full max-h-64 object-contain"
                 />
               )}
+              {msg.documentName && (
+                <div
+                  className={`mb-2 flex items-center gap-2 rounded-lg px-2 py-1 text-sm ${
+                    msg.role === "user" ? "bg-blue-500/30" : "bg-gray-100"
+                  }`}
+                >
+                  📄 {msg.documentName}
+                </div>
+              )}
               {msg.text}
 
               {msg.needsApproval && msg.actionId && (
@@ -516,6 +590,20 @@ export default function Home() {
         </div>
       )}
 
+      {selectedDocument && (
+        <div className="px-4 pt-2 bg-white">
+          <div className="relative inline-flex items-center gap-2 bg-gray-100 rounded-lg px-3 py-2">
+            <span className="text-sm">📄 {selectedDocument.name}</span>
+            <button
+              onClick={() => setSelectedDocument(null)}
+              className="text-red-500 hover:text-red-700 text-xs font-bold"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="p-4 bg-white border-t flex gap-2 items-end">
         <input
           type="file"
@@ -525,12 +613,28 @@ export default function Home() {
           className="hidden"
         />
 
+        <input
+          type="file"
+          accept=".pdf,.docx,.txt"
+          ref={documentInputRef}
+          onChange={handleDocumentChange}
+          className="hidden"
+        />
+
         <button
           onClick={handleAttachClick}
           className="bg-gray-200 hover:bg-gray-300 px-3 py-2 rounded-xl text-lg"
           title="Attach image"
         >
           📎
+        </button>
+
+        <button
+          onClick={handleDocumentClick}
+          className="bg-gray-200 hover:bg-gray-300 px-3 py-2 rounded-xl text-lg"
+          title="Attach document (PDF, Word, or text file)"
+        >
+          📄
         </button>
 
         <button

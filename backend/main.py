@@ -17,12 +17,16 @@ import os
 import webbrowser
 import subprocess
 import uuid
+import base64
+import io
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from ddgs import DDGS
 import pywhatkit
 import dateparser
 from dateparser.search import search_dates
+from pypdf import PdfReader
+from docx import Document
 
 app = FastAPI()
 
@@ -112,6 +116,12 @@ class ChatRequest(BaseModel):
 class ImageChatRequest(BaseModel):
     message: str
     image_base64: str
+    session_id: Optional[str] = None
+
+class DocumentChatRequest(BaseModel):
+    message: str
+    filename: str
+    file_base64: str
     session_id: Optional[str] = None
 
 class ApprovalRequest(BaseModel):
@@ -312,15 +322,6 @@ def normalize_time_text(text):
 
 
 def parse_clock_time_directly(text):
-    """
-    THE RELIABLE TIME FIX: handles the most common reminder phrasing
-    ourselves with simple, guaranteed-correct logic - an explicit clock
-    time like "5pm", "01:06 PM", "9:30 am". This bypasses the flexible
-    date-parsing library entirely for this case, since it was
-    occasionally misreading times like "01:06 PM" as a date days or
-    even years in the future instead of just "today (or tomorrow) at
-    that time". Returns (datetime, matched_text) or (None, None).
-    """
     match = re.search(r'\b(\d{1,2}):?(\d{2})?\s*(am|pm)\b', text, re.IGNORECASE)
     if not match:
         return None, None
@@ -357,15 +358,11 @@ def clean_reminder_message(text, matched_text):
 def parse_reminder(description):
     cleaned = normalize_time_text(description)
 
-    # First, try our own simple/reliable direct match for explicit clock
-    # times - this is the most common case and the one that was breaking.
     direct_time, matched_text = parse_clock_time_directly(cleaned)
     if direct_time:
         message = clean_reminder_message(cleaned, matched_text)
         return direct_time, message
 
-    # Fall back to the flexible parser for everything else (relative
-    # times like "in 5 minutes", "tomorrow", specific dates, etc.)
     results = search_dates(
         cleaned,
         settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False}
@@ -566,6 +563,55 @@ def find_relevant_memories(current_message, limit=5):
         scored.append((score, role, content))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:limit]
+
+
+# =============================================================================
+# DOCUMENT READING (THE NEW FEATURE)
+# Lets the AI read PDF, Word (.docx), and plain text files you attach, then
+# answer questions about them - the same idea as image understanding, just
+# for documents instead of pictures.
+# =============================================================================
+
+MAX_DOCUMENT_CHARS = 12000  # keeps the document within a safe size for the AI's context window
+
+
+def extract_text_from_pdf(file_bytes):
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+        return "\n".join(text_parts)
+    except Exception as e:
+        return f"[Error reading PDF: {e}]"
+
+
+def extract_text_from_docx(file_bytes):
+    try:
+        doc = Document(io.BytesIO(file_bytes))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs)
+    except Exception as e:
+        return f"[Error reading Word document: {e}]"
+
+
+def extract_document_text(filename, file_base64):
+    file_bytes = base64.b64decode(file_base64)
+    filename_lower = filename.lower()
+
+    if filename_lower.endswith(".pdf"):
+        return extract_text_from_pdf(file_bytes)
+    elif filename_lower.endswith(".docx"):
+        return extract_text_from_docx(file_bytes)
+    elif filename_lower.endswith(".txt"):
+        try:
+            return file_bytes.decode("utf-8", errors="ignore")
+        except Exception as e:
+            return f"[Error reading text file: {e}]"
+    else:
+        return None
 
 
 SYSTEM_PROMPT = """You are a helpful assistant with access to tools, long-term memory, and computer control.
@@ -986,6 +1032,47 @@ def chat_image(request: ImageChatRequest):
     if "response" not in result:
         return {"reply": f"Error from vision model: {result}"}
     ai_reply = result["response"]
+    save_message("assistant", ai_reply, request.session_id)
+    return {"reply": ai_reply}
+
+
+@app.post("/chat-document")
+def chat_document(request: DocumentChatRequest):
+    save_message("user", request.message + f" [sent a document: {request.filename}]", request.session_id)
+
+    document_text = extract_document_text(request.filename, request.file_base64)
+
+    if document_text is None:
+        reply = f"Sorry, I can only read .pdf, .docx, and .txt files right now - '{request.filename}' isn't one of those."
+        save_message("assistant", reply, request.session_id)
+        return {"reply": reply}
+
+    if not document_text.strip():
+        reply = f"I opened '{request.filename}' but couldn't find any readable text inside it - it might be a scanned image or an empty file."
+        save_message("assistant", reply, request.session_id)
+        return {"reply": reply}
+
+    truncated = False
+    if len(document_text) > MAX_DOCUMENT_CHARS:
+        document_text = document_text[:MAX_DOCUMENT_CHARS]
+        truncated = True
+
+    truncation_note = "\n\n[Note: this document was long, so only the first portion is shown above.]" if truncated else ""
+
+    document_prompt = [
+        {"role": "system", "content": (
+            "You are a helpful assistant. The user has shared a document with you. "
+            "Answer their question using ONLY the document content below as your source of truth. "
+            "If the answer isn't in the document, say so honestly instead of guessing."
+        )},
+        {"role": "user", "content": (
+            f"Document filename: {request.filename}\n\n"
+            f"Document content:\n{document_text}{truncation_note}\n\n"
+            f"My question: {request.message}"
+        )}
+    ]
+
+    ai_reply = ask_ollama_chat(document_prompt)
     save_message("assistant", ai_reply, request.session_id)
     return {"reply": ai_reply}
 
