@@ -393,9 +393,38 @@ def set_reminder(description, session_id=None):
     return f'Got it - I\'ll remind you to "{message}" at {friendly_time}.'
 
 
+# THE APP-NAME FIX: Windows doesn't recognize friendly names like "vscode"
+# or "word" as launchable programs - it needs their actual command-line
+# names ("code", "winword"). This maps common nicknames to what Windows
+# actually understands, the same trick already used for website names.
+COMMON_APPS = {
+    "vscode": "code",
+    "vs code": "code",
+    "visual studio code": "code",
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "word": "winword",
+    "microsoft word": "winword",
+    "excel": "excel",
+    "microsoft excel": "excel",
+    "powerpoint": "powerpnt",
+    "microsoft powerpoint": "powerpnt",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "paint": "mspaint",
+    "explorer": "explorer",
+    "file explorer": "explorer",
+    "spotify": "spotify",
+}
+
+
 def open_app(app_name):
     try:
-        os.system(f"start {app_name}")
+        key = app_name.strip().lower()
+        actual_command = COMMON_APPS.get(key, app_name)
+        os.system(f"start {actual_command}")
         return f"Opened {app_name}"
     except Exception as e:
         return f"Failed to open {app_name}: {e}"
@@ -565,14 +594,7 @@ def find_relevant_memories(current_message, limit=5):
     return scored[:limit]
 
 
-# =============================================================================
-# DOCUMENT READING (THE NEW FEATURE)
-# Lets the AI read PDF, Word (.docx), and plain text files you attach, then
-# answer questions about them - the same idea as image understanding, just
-# for documents instead of pictures.
-# =============================================================================
-
-MAX_DOCUMENT_CHARS = 12000  # keeps the document within a safe size for the AI's context window
+MAX_DOCUMENT_CHARS = 12000
 
 
 def extract_text_from_pdf(file_bytes):
@@ -646,7 +668,10 @@ Available tools:
 - create_file(description) -> writes code/content to a file and opens it in notepad or vscode.
   If the user gives a filename (e.g. "save it as KD.html" or "save it as Karan")
   or a folder path (e.g. "E:\\MyFolder"), include that exact wording in the
-  description so it gets saved with the right name and in the right place.
+  description so it gets saved with the right name and in the right place. If the user wants it
+  opened in VS Code, include "vscode" or "vs code" in the description too, in the SAME tool call
+  as create_file - do not use a separate open_app step for this, since create_file already opens
+  the file in the right program itself.
 
 Examples:
 User: tell me a fun fact
@@ -670,9 +695,8 @@ You: TOOL: set_reminder(wake me up in 5 minutes)
 User: play gta 6 trailer on youtube
 You: TOOL: play_youtube(gta 6 trailer)
 
-User: write python code and open it in vscode, then also open my documents folder
-You: TOOL: create_file(python code, open in vscode)
-TOOL: open_folder(C:\\Users\\KARAN\\Documents)
+User: write addition code in C and open in vscode
+You: TOOL: create_file(addition code in C, open in vscode)
 
 User: write html code for a landing page, save it as KD.html in E:\Projects
 You: TOOL: create_file(html code for a landing page, save it as KD.html in E:\\Projects)
