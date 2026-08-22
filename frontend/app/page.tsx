@@ -24,7 +24,52 @@ type ReminderItem = {
   notified: boolean;
 };
 
+const API_BASE =
+  typeof window !== "undefined"
+    ? `http://${window.location.hostname}:8000`
+    : "http://127.0.0.1:8000";
+
+// THE PHONE BLANK-SCREEN FIX: crypto.randomUUID() only works on
+// "localhost" or an HTTPS site - browsers block it on a plain network
+// address like 192.168.x.x over HTTP, which crashed the whole page
+// silently on your phone. This works everywhere, no restrictions.
+function generateId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    try {
+      return crypto.randomUUID();
+    } catch (e) {
+      // fall through to the manual fallback below
+    }
+  }
+  return "id-" + Date.now() + "-" + Math.random().toString(36).slice(2, 15);
+}
+
+function getAuthToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("assistant_auth_token");
+}
+
+async function authFetch(path: string, options: RequestInit = {}) {
+  const token = getAuthToken();
+  const headers = {
+    ...(options.headers || {}),
+    "X-Auth-Token": token || "",
+  };
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (res.status === 401) {
+    localStorage.removeItem("assistant_auth_token");
+    window.location.reload();
+  }
+  return res;
+}
+
 export default function Home() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -42,7 +87,15 @@ export default function Home() {
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
-    setSessionId(crypto.randomUUID());
+    const token = getAuthToken();
+    if (token) {
+      setIsAuthenticated(true);
+    }
+    setCheckingAuth(false);
+  }, []);
+
+  useEffect(() => {
+    setSessionId(generateId());
   }, []);
 
   useEffect(() => {
@@ -73,13 +126,15 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
+
     if ("Notification" in window && Notification.permission === "default") {
       Notification.requestPermission();
     }
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch("http://127.0.0.1:8000/reminders/due");
+        const res = await authFetch("/reminders/due");
         const data = await res.json();
         if (data.due && data.due.length > 0) {
           for (const reminder of data.due) {
@@ -99,7 +154,42 @@ export default function Home() {
     }, 20000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [isAuthenticated]);
+
+  async function handleLogin() {
+    setLoginError("");
+    setLoginLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: loginPassword }),
+      });
+      if (!res.ok) {
+        setLoginError("Wrong password. Try again.");
+        setLoginLoading(false);
+        return;
+      }
+      const data = await res.json();
+      localStorage.setItem("assistant_auth_token", data.token);
+      setIsAuthenticated(true);
+      setLoginPassword("");
+    } catch (e) {
+      setLoginError("Couldn't reach the server. Make sure the backend is running.");
+    }
+    setLoginLoading(false);
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("assistant_auth_token");
+    setIsAuthenticated(false);
+  }
+
+  function handleLoginKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter") {
+      handleLogin();
+    }
+  }
 
   function startListening() {
     if (recognitionRef.current) {
@@ -132,9 +222,6 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
-  // THE DOCUMENT UPLOAD FIX: same idea as image attaching, but for PDF,
-  // Word, and text files. Converts the chosen file to base64 so it can
-  // be sent to the backend, where the actual text gets extracted.
   function handleDocumentClick() {
     documentInputRef.current?.click();
   }
@@ -160,11 +247,11 @@ export default function Home() {
 
   function startNewChat() {
     setMessages([]);
-    setSessionId(crypto.randomUUID());
+    setSessionId(generateId());
   }
 
   async function exportHistory() {
-    const res = await fetch("http://127.0.0.1:8000/history");
+    const res = await authFetch("/history");
     const data = await res.json();
     const items: HistoryItem[] = data.history;
 
@@ -197,14 +284,14 @@ export default function Home() {
   }
 
   async function openReminders() {
-    const res = await fetch("http://127.0.0.1:8000/reminders");
+    const res = await authFetch("/reminders");
     const data = await res.json();
     setReminders(data.reminders);
     setShowReminders(true);
   }
 
   async function deleteReminder(id: number) {
-    await fetch("http://127.0.0.1:8000/reminders/delete", {
+    await authFetch("/reminders/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id }),
@@ -215,9 +302,6 @@ export default function Home() {
   async function sendMessage() {
     if (!input.trim() && !selectedImage && !selectedDocument) return;
 
-    // Document messages are handled separately, non-streamed (same
-    // pattern as images) since they go through their own dedicated
-    // endpoint that extracts text first.
     if (selectedDocument) {
       const userMessage: Message = {
         role: "user",
@@ -233,7 +317,7 @@ export default function Home() {
       setSelectedDocument(null);
       setLoading(true);
 
-      const res = await fetch("http://127.0.0.1:8000/chat-document", {
+      const res = await authFetch("/chat-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -266,7 +350,7 @@ export default function Home() {
     setLoading(true);
 
     if (imageToSend) {
-      const res = await fetch("http://127.0.0.1:8000/chat-image", {
+      const res = await authFetch("/chat-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -283,7 +367,7 @@ export default function Home() {
       return;
     }
 
-    const res = await fetch("http://127.0.0.1:8000/chat-stream", {
+    const res = await authFetch("/chat-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: messageText, session_id: sessionId }),
@@ -352,7 +436,7 @@ export default function Home() {
   async function respondToApproval(actionId: string, approved: boolean, messageIndex: number) {
     setLoading(true);
 
-    const res = await fetch("http://127.0.0.1:8000/approve-action", {
+    const res = await authFetch("/approve-action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action_id: actionId, approved }),
@@ -380,7 +464,7 @@ export default function Home() {
   }
 
   async function openHistory() {
-    const res = await fetch("http://127.0.0.1:8000/history");
+    const res = await authFetch("/history");
     const data = await res.json();
     setHistory(data.history);
     setShowHistory(true);
@@ -391,6 +475,40 @@ export default function Home() {
       e.preventDefault();
       sendMessage();
     }
+  }
+
+  if (checkingAuth) {
+    return <div className="flex h-screen bg-gray-100" />;
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-100">
+        <div className="bg-white rounded-2xl shadow p-8 w-full max-w-sm">
+          <h1 className="text-xl font-semibold mb-1">Karan's AI Assistant</h1>
+          <p className="text-gray-500 text-sm mb-6">Enter your password to continue</p>
+          <input
+            type="password"
+            value={loginPassword}
+            onChange={(e) => setLoginPassword(e.target.value)}
+            onKeyDown={handleLoginKeyDown}
+            placeholder="Password"
+            className="w-full border rounded-xl px-3 py-2 mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            autoFocus
+          />
+          {loginError && (
+            <p className="text-red-500 text-sm mb-3">{loginError}</p>
+          )}
+          <button
+            onClick={handleLogin}
+            disabled={loginLoading}
+            className="w-full bg-blue-600 text-white py-2 rounded-xl hover:bg-blue-700 disabled:opacity-50"
+          >
+            {loginLoading ? "Checking..." : "Unlock"}
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -423,6 +541,13 @@ export default function Home() {
             title="Download your full chat history as a text file"
           >
             ⬇️ Export
+          </button>
+          <button
+            onClick={handleLogout}
+            className="bg-red-100 hover:bg-red-200 text-red-700 text-sm px-3 py-1.5 rounded-lg"
+            title="Log out"
+          >
+            🔒 Logout
           </button>
         </div>
       </div>

@@ -2,9 +2,9 @@
 #  KARAN'S AI ASSISTANT - BACKEND (main.py)
 # =============================================================================
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import requests
@@ -111,7 +111,66 @@ CREATE TABLE IF NOT EXISTS reminders (
 )
 """)
 _startup_conn.commit()
+
+# THE EMAIL SAFETY FIX: logs every email attempt, so we can enforce a
+# daily sending limit and keep a record of what was actually sent.
+_startup_cursor.execute("""
+CREATE TABLE IF NOT EXISTS sent_emails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_address TEXT,
+    subject TEXT,
+    sent_at TEXT,
+    success INTEGER
+)
+""")
+_startup_conn.commit()
 _startup_conn.close()
+
+
+# =============================================================================
+# LOGIN / SECURITY
+# Protects the whole app behind a single password (yours). Anyone on your
+# WiFi could otherwise reach it once your phone can connect - this stops
+# that. A successful login gets a random token that must be sent with
+# every request after that.
+# =============================================================================
+
+ASSISTANT_PASSWORD = os.environ.get("ASSISTANT_PASSWORD")
+AUTH_TOKENS = set()
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.middleware("http")
+async def check_auth(request: Request, call_next):
+    # Browsers send an automatic "OPTIONS" check before real requests when
+    # custom headers are used - this must always be allowed through, or
+    # every request from your phone/another device would silently fail.
+    if request.method == "OPTIONS" or request.url.path in ["/", "/login"]:
+        return await call_next(request)
+
+    token = request.headers.get("x-auth-token")
+    if not ASSISTANT_PASSWORD or token not in AUTH_TOKENS:
+        return JSONResponse(status_code=401, content={"error": "Not authenticated"})
+
+    return await call_next(request)
+
+
+@app.post("/login")
+def login(request: LoginRequest):
+    if not ASSISTANT_PASSWORD:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "No password is set up yet - add ASSISTANT_PASSWORD to your .env file."}
+        )
+    if request.password != ASSISTANT_PASSWORD:
+        return JSONResponse(status_code=401, content={"error": "Wrong password"})
+
+    token = str(uuid.uuid4())
+    AUTH_TOKENS.add(token)
+    return {"token": token}
 
 
 class ChatRequest(BaseModel):
@@ -575,15 +634,9 @@ def create_and_open_file(content, description):
         return f"Failed to create file: {e}"
 
 
-# =============================================================================
-# EMAIL SENDING (THE NEW FEATURE)
-# Lets you say "email my supervisor that I'm sick" - the AI writes the
-# actual email itself, shows it to you for approval, and only sends it
-# after you click Approve. Uses your Gmail App Password from the .env file.
-# =============================================================================
-
 EMAIL_ADDRESS = os.environ.get("ASSISTANT_EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("ASSISTANT_EMAIL_APP_PASSWORD")
+DAILY_EMAIL_LIMIT = 15
 
 
 def parse_email_tool_arg(tool_arg):
@@ -612,12 +665,37 @@ def compose_email_content(about):
     return subject, body
 
 
+def get_emails_sent_today():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    row = db_execute(
+        "SELECT COUNT(*) FROM sent_emails WHERE sent_at LIKE ? AND success = 1",
+        (f"{today_str}%",), fetch="one"
+    )
+    return row[0] if row else 0
+
+
+def log_sent_email(to_address, subject, success):
+    db_execute(
+        "INSERT INTO sent_emails (to_address, subject, sent_at, success) VALUES (?, ?, ?, ?)",
+        (to_address, subject, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 1 if success else 0),
+        commit=True
+    )
+
+
 def send_email_now(to_address, subject, body):
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
         return ("Email sending isn't set up yet - ASSISTANT_EMAIL_ADDRESS and "
                 "ASSISTANT_EMAIL_APP_PASSWORD need to be in your .env file first.")
     if not to_address:
         return "I don't have a valid recipient email address, so I couldn't send this."
+
+    # THE EMAIL SAFETY FIX: a daily cap prevents any bug or mistake from
+    # accidentally sending a flood of emails - the AI will simply refuse
+    # once the limit is hit, and it resets automatically the next day.
+    if get_emails_sent_today() >= DAILY_EMAIL_LIMIT:
+        return (f"I've hit today's safety limit of {DAILY_EMAIL_LIMIT} emails, to prevent "
+                f"accidental mass-sending. This resets tomorrow.")
+
     try:
         msg = MIMEText(body or "")
         msg["Subject"] = subject or "Message from your assistant"
@@ -629,8 +707,10 @@ def send_email_now(to_address, subject, body):
             server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
             server.send_message(msg)
 
+        log_sent_email(to_address, subject, True)
         return f"Email sent to {to_address} with subject '{subject}'"
     except Exception as e:
+        log_sent_email(to_address, subject, False)
         return f"Failed to send email: {e}"
 
 
