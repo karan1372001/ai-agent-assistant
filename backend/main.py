@@ -19,6 +19,9 @@ import subprocess
 import uuid
 import base64
 import io
+import smtplib
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from ddgs import DDGS
@@ -27,6 +30,8 @@ import dateparser
 from dateparser.search import search_dates
 from pypdf import PdfReader
 from docx import Document
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -206,11 +211,6 @@ def detect_and_save_facts(message):
     if boss_match:
         save_fact("relationship", "The user is my boss.")
 
-    # THE ASSISTANT NAME FIX: previously, renaming the AI (e.g. "your name
-    # is Jarvis") was never saved as a real, permanent fact - it only
-    # seemed to work because of the fuzzy long-term memory search finding
-    # it by luck, which isn't reliable and can eventually stop working.
-    # This makes it a guaranteed fact, exactly like your own name.
     assistant_name_match = re.search(
         r"(?:from now on[, ]+)?your name is (\w+)|i(?:'ll| will) call you (\w+)|call yourself (\w+)",
         message_lower
@@ -362,10 +362,6 @@ def parse_clock_time_directly(text):
 
 def clean_reminder_message(text, matched_text):
     message = text.replace(matched_text, "")
-    # THE REMINDER TEXT FIX: strip common leading/trailing filler words
-    # more thoroughly, including leftover "remind me", "to", "in", numbers
-    # and time-unit words ("min", "minutes") that used to linger after
-    # removing just the clock time itself.
     message = re.sub(r'\bat\s*$', '', message, flags=re.IGNORECASE)
     message = re.sub(r'^(remind me( to)?|to remind me( to)?)\s+', '', message, flags=re.IGNORECASE).strip()
     message = re.sub(r'^(to|that|about|for|me to)\s+', '', message, flags=re.IGNORECASE).strip()
@@ -579,7 +575,66 @@ def create_and_open_file(content, description):
         return f"Failed to create file: {e}"
 
 
-COMPUTER_CONTROL_TOOLS = ["open_app", "open_website", "play_youtube", "open_folder", "create_file"]
+# =============================================================================
+# EMAIL SENDING (THE NEW FEATURE)
+# Lets you say "email my supervisor that I'm sick" - the AI writes the
+# actual email itself, shows it to you for approval, and only sends it
+# after you click Approve. Uses your Gmail App Password from the .env file.
+# =============================================================================
+
+EMAIL_ADDRESS = os.environ.get("ASSISTANT_EMAIL_ADDRESS")
+EMAIL_APP_PASSWORD = os.environ.get("ASSISTANT_EMAIL_APP_PASSWORD")
+
+
+def parse_email_tool_arg(tool_arg):
+    to_match = re.search(r'to\s*=\s*([^\s,]+@[^\s,]+)', tool_arg, re.IGNORECASE)
+    about_match = re.search(r'about\s*=\s*(.+)$', tool_arg, re.IGNORECASE)
+    to_address = to_match.group(1).strip() if to_match else None
+    about = about_match.group(1).strip() if about_match else tool_arg.strip()
+    return to_address, about
+
+
+def compose_email_content(about):
+    content_prompt = [
+        {"role": "system", "content": (
+            "Write a short, professional email based on the user's description. "
+            "Respond in EXACTLY this format and nothing else:\n"
+            "SUBJECT: <a short subject line>\n"
+            "BODY:\n<the full email body text, written professionally>"
+        )},
+        {"role": "user", "content": about}
+    ]
+    raw = ask_ollama_chat(content_prompt)
+    subject_match = re.search(r'SUBJECT:\s*(.+)', raw)
+    body_match = re.search(r'BODY:\s*(.*)', raw, re.DOTALL)
+    subject = subject_match.group(1).strip() if subject_match else "Message from your assistant"
+    body = body_match.group(1).strip() if body_match else raw.strip()
+    return subject, body
+
+
+def send_email_now(to_address, subject, body):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        return ("Email sending isn't set up yet - ASSISTANT_EMAIL_ADDRESS and "
+                "ASSISTANT_EMAIL_APP_PASSWORD need to be in your .env file first.")
+    if not to_address:
+        return "I don't have a valid recipient email address, so I couldn't send this."
+    try:
+        msg = MIMEText(body or "")
+        msg["Subject"] = subject or "Message from your assistant"
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = to_address
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+
+        return f"Email sent to {to_address} with subject '{subject}'"
+    except Exception as e:
+        return f"Failed to send email: {e}"
+
+
+COMPUTER_CONTROL_TOOLS = ["open_app", "open_website", "play_youtube", "open_folder", "create_file", "send_email"]
 MAX_TOOL_ROUNDS = 4
 
 
@@ -681,6 +736,10 @@ Available tools:
 - set_reminder(description) -> creates a reminder. The description MUST include both WHAT to
   remind about and WHEN, in natural language, e.g. set_reminder(call mom at 5pm) or
   set_reminder(check the oven in 30 minutes) or set_reminder(wake me up in 5 minutes).
+- send_email(to=recipient_email, about=what the email should say) -> composes and sends a REAL
+  email. ALWAYS include a valid email address after "to=". Describe what the email should
+  communicate after "about=" in your own words - you do NOT need to write the actual email text,
+  a separate step composes a professional email for you based on your description.
 - open_app(app_name) -> opens an application
 - open_website(url) -> opens a website - only when the user specifically asks to open/visit a site
 - play_youtube(song_name) -> searches and plays a video on YouTube
@@ -708,8 +767,8 @@ You: TOOL: get_weather(Middlesbrough)
 User: remind me at 5pm to call mom
 You: TOOL: set_reminder(call mom at 5pm)
 
-User: wake me up in 5 minutes
-You: TOOL: set_reminder(wake me up in 5 minutes)
+User: email my supervisor john@company.com that I'm sick and can't come to work
+You: TOOL: send_email(to=john@company.com, about=I am sick today and unable to come to work)
 
 User: play gta 6 trailer on youtube
 You: TOOL: play_youtube(gta 6 trailer)
@@ -789,6 +848,10 @@ def create_permission_request(steps, session_id=None):
     remaining_steps = steps[1:]
 
     content_for_file = None
+    email_to = None
+    email_subject = None
+    email_body = None
+
     if first_tool_name == "create_file":
         content_prompt = [
             {"role": "system", "content": f"Write ONLY the raw code/content for: {first_tool_arg}. No explanation, no markdown, no backticks."},
@@ -796,11 +859,19 @@ def create_permission_request(steps, session_id=None):
         ]
         content_for_file = ask_ollama_chat(content_prompt)
 
+    elif first_tool_name == "send_email":
+        email_to, about = parse_email_tool_arg(first_tool_arg)
+        if email_to:
+            email_subject, email_body = compose_email_content(about)
+
     action_id = str(uuid.uuid4())
     PENDING_ACTIONS[action_id] = {
         "tool_name": first_tool_name,
         "tool_arg": first_tool_arg,
         "content": content_for_file,
+        "email_to": email_to,
+        "email_subject": email_subject,
+        "email_body": email_body,
         "remaining_steps": remaining_steps,
         "session_id": session_id,
     }
@@ -811,6 +882,17 @@ def create_permission_request(steps, session_id=None):
     if first_tool_name == "create_file":
         preview = content_for_file[:150] + ("..." if len(content_for_file) > 150 else "")
         reply = f"I'd like to create a file with this content{step_info}:\n\n{preview}\n\nDo you approve?"
+    elif first_tool_name == "send_email":
+        if not email_to:
+            reply = "I couldn't figure out who to send this to - please include their email address, e.g. 'email john@example.com that I'm sick'."
+        else:
+            reply = (
+                f"I'd like to send this email{step_info}:\n\n"
+                f"To: {email_to}\n"
+                f"Subject: {email_subject}\n\n"
+                f"{email_body}\n\n"
+                f"Do you approve?"
+            )
     else:
         reply = f"I'd like to: {description.replace('_', ' ')}{step_info}. Do you approve this action?"
 
@@ -824,7 +906,7 @@ def create_permission_request(steps, session_id=None):
     }
 
 
-def run_single_tool(tool_name, tool_arg, content=None):
+def run_single_tool(tool_name, tool_arg, content=None, email_to=None, email_subject=None, email_body=None):
     if tool_name == "open_app":
         return open_app(tool_arg)
     elif tool_name == "open_website":
@@ -835,6 +917,8 @@ def run_single_tool(tool_name, tool_arg, content=None):
         return open_folder(tool_arg)
     elif tool_name == "create_file":
         return create_and_open_file(content, tool_arg)
+    elif tool_name == "send_email":
+        return send_email_now(email_to, email_subject, email_body)
     else:
         return "Unknown tool"
 
@@ -913,11 +997,6 @@ def build_chat_messages(user_message, session_id=None):
 
     relevant = find_relevant_memories(user_message, limit=5)
 
-    # THE JARVIS FIX: separate out the assistant's own name from the rest
-    # of the facts, and inject it as a clear, direct instruction at the
-    # very top of the system prompt - guaranteed to be included every
-    # single time, in every new chat, forever (not dependent on fuzzy
-    # memory search finding it by chance).
     facts = get_all_facts()
     assistant_name = None
     user_facts = []
@@ -1067,9 +1146,15 @@ def approve_action(request: ApprovalRequest):
     tool_name = action["tool_name"]
     tool_arg = action["tool_arg"]
     content = action.get("content")
-    remaining_steps = action.get("remaining_steps", [])
 
-    tool_result = run_single_tool(tool_name, tool_arg, content)
+    tool_result = run_single_tool(
+        tool_name, tool_arg, content,
+        email_to=action.get("email_to"),
+        email_subject=action.get("email_subject"),
+        email_body=action.get("email_body"),
+    )
+
+    remaining_steps = action.get("remaining_steps", [])
     del PENDING_ACTIONS[request.action_id]
 
     if tool_name in TRUSTABLE_TOOLS:
